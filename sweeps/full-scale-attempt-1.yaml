@@ -1,0 +1,22 @@
+method: grid
+name: full-scale-attempt-1-seed-64
+project: translation-compression
+program: train.py
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --job.config-file
+  - ./config/sweep-base-fineweb.toml
+  - ${args}
+parameters:
+  model.size_tier:
+    values: ["8-32", "8-64", "8-128", "8-256"]
+  training.seed:
+    values: [64]
+  experiment.n_compartments:
+    values: [2, 4, 8, 16, 128]
+  experiment.compartment_scaling:
+    values: ["equal", "unequal"]
+  experiment.translation_ratio:
+    values: [0, 0.01, 0.1, 0.5, 1.0]
