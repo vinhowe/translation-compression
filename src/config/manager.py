@@ -125,6 +125,32 @@ class ConfigManager:
         if self.config.logging.checkpoint_folder:
             os.makedirs(self.config.logging.checkpoint_folder, exist_ok=True)
 
+        # Experiment requirements
+        exp = self.config.experiment
+        # Require max_compartments
+        if exp.max_compartments is None:
+            raise ValueError("experiment.max_compartments is required")
+        if exp.max_compartments <= 0:
+            raise ValueError("experiment.max_compartments must be > 0")
+        # Derived-weights validation
+        if exp.n_compartments < 1:
+            raise ValueError("experiment.n_compartments must be >= 1")
+        if exp.translation_ratio < 0:
+            raise ValueError("experiment.translation_ratio must be >= 0")
+        if (
+            exp.max_compartments is not None
+            and exp.n_compartments > exp.max_compartments
+        ):
+            raise ValueError(
+                "experiment.n_compartments must be <= experiment.max_compartments"
+            )
+
+        # Validate advanced options: shared_token_embeddings vs weight tying
+        if exp.shared_token_embeddings and self.config.model.weight_tying:
+            raise ValueError(
+                "experiment.shared_token_embeddings is mutually exclusive with model.weight_tying"
+            )
+
     @staticmethod
     def register_tyro_rules(registry: tyro.constructors.ConstructorRegistry) -> None:
         """Register custom parsing rules for tyro."""

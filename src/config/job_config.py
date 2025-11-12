@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -11,8 +12,10 @@ class Job:
 
 @dataclass(frozen=True)
 class Data:
+    source: Literal["pretokenized", "uniform"] = "pretokenized"
     train_bin: str = ""
     val_bin: str | None = None
+    uniform_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,22 @@ class Model:
     dropout: float = 0.0
     bias: bool = False
     weight_tying: bool = True
+    # Optional: preset size tier (e.g., "8-32", "8-64", "8-128", "8-256")
+    size_tier: str | None = None
+    # Optional advanced options (set programmatically in train.py)
+    # When shared_token_embeddings is enabled, embedding_vocab_size should be base_vocab_size + 1.
+    embedding_vocab_size: int | None = None
+    shared_token_embeddings: bool = False
+    use_compartment_embeddings: bool = False
+    # These are provided so the model has the necessary context when advanced options are used.
+    base_vocab_size: int | None = None
+    max_compartments: int | None = None
+    translation_token_id: int | None = None
+    # If true (and not using shared_token_embeddings), clone base compartment
+    # token embeddings across all compartments at initialization time.
+    copy_compartment_embeddings: bool = False
+    # If true, clone the lm_head rows for the base vocab across compartments.
+    copy_compartment_lm_head: bool = False
     # vocab_size is derived from dataset meta by default
     vocab_size: int | None = None
 
@@ -37,19 +56,19 @@ class Init:
 
 @dataclass(frozen=True)
 class Optimizer:
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-1
+    learning_rate: float = 5e-2
+    weight_decay: float = 0
     beta1: float = 0.9
-    beta2: float = 0.95
+    beta2: float = 0.999
     grad_clip: float = 1.0
 
 
 @dataclass(frozen=True)
 class LRScheduler:
-    decay_lr: bool = True
-    warmup_iters: int = 2000
-    lr_decay_iters: int = 600000
-    min_lr: float = 6e-5
+    # decay_lr: bool = True
+    warmup_iters: int = 1000
+    # lr_decay_iters: int = 600000
+    # min_lr: float = 6e-5
 
 
 @dataclass(frozen=True)
@@ -90,6 +109,62 @@ class Logging:
     checkpoint_folder: str = "out"
 
 
+# @dataclass(frozen=True)
+# class Experiment:
+#     """Experiment-specific options for assignment generation."""
+#     # Mapping from compartment id (e.g., "0") or translation (e.g., "0>1") to weight
+#     weights: dict[str, float] = field(default_factory=dict)
+#     # Shuffle seed for deterministic ordering (defaults to 0; you can override in TOML)
+#     assignment_seed: int = 0
+#     # Maximum number of compartments. REQUIRED: must be provided in config.
+#     max_compartments: int | None = None
+#     # Advanced options
+#     # If true, use one shared token embedding table of size base_vocab+1 and map inputs modulo base_vocab
+#     shared_token_embeddings: bool = False
+#     # If true, add a learned compartment embedding (max_compartments x n_embd) to token+pos embeddings
+#     use_compartment_embeddings: bool = False
+#     # If true and not using shared_token_embeddings, clone base token embeddings
+#     # across compartments during initialization (model-side behavior).
+#     copy_compartment_embeddings: bool = False
+#     copy_compartment_lm_head: bool = False
+#     # If true, use per-compartment permutations of base tokens. Model/tokenizer
+#     # vocab becomes base_vocab+1 (translation token only) and tokens are mapped
+#     # through a seeded permutation per compartment at data loading time.
+#     permute_tokens_per_compartment: bool = False
+
+
+@dataclass(frozen=True)
+class Experiment:
+    """Experiment-specific options for assignment generation."""
+
+    # n
+    n_compartments: int = 2
+    # Whether we're in experiments 1,3 or 2,4
+    compartment_scaling: Literal["equal", "unequal"] = "equal"
+    # Scaling factor for translation tokens; 0 = no translations, 1 = as much
+    # translation data as any one domain
+    translation_ratio: float = 0
+    # Shuffle seed for deterministic ordering
+    assignment_seed: int = 0
+    # Maximum number of compartments. REQUIRED: must be provided in config.
+    max_compartments: int | None = None
+    # Advanced options
+    # If true, use one shared token embedding table of size base_vocab+1 and map inputs
+    # modulo base_vocab
+    shared_token_embeddings: bool = False
+    # If true, add a learned compartment embedding (max_compartments x n_embd) to
+    # token+pos embeddings
+    use_compartment_embeddings: bool = False
+    # If true and not using shared_token_embeddings, clone base token embeddings
+    # across compartments during initialization (model-side behavior).
+    copy_compartment_embeddings: bool = False
+    copy_compartment_lm_head: bool = False
+    # If true, use per-compartment permutations of base tokens. Model/tokenizer
+    # vocab becomes base_vocab+1 (translation token only) and tokens are mapped
+    # through a seeded permutation per compartment at data loading time.
+    permute_tokens_per_compartment: bool = True
+
+
 @dataclass(frozen=True)
 class JobConfig:
     """Configuration container for training."""
@@ -104,6 +179,7 @@ class JobConfig:
     distributed: Distributed = field(default_factory=Distributed)
     system: System = field(default_factory=System)
     logging: Logging = field(default_factory=Logging)
+    experiment: Experiment = field(default_factory=Experiment)
 
     def to_dict(self) -> dict[str, any]:  # pyright: ignore
         return asdict(self)

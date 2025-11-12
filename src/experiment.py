@@ -17,9 +17,7 @@ def _slug(s: str) -> str:
 def _canonical_cfg_dict(cfg: JobConfig) -> dict:
     d = asdict(cfg)
     return {
-        "model": d["model"],
-        "data": d["data"],
-        "optimizer": d["optimizer"],
+        **d,
         "lr": d["lr"],
         "seed": d["training"]["seed"],
     }
@@ -45,25 +43,30 @@ def _timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
 
 
-def run_dir(
+def run_dirs(
     root: str, project: str, group: str | None, name: str, cfg: JobConfig, runid: str
-) -> str:
-    return os.path.join(
-        root,
-        _slug(project),
-        _slug(group or "default"),
+) -> tuple[str, str, str]:
+    project_dir = os.path.join(root, _slug(project))
+    group_dir = os.path.join(project_dir, _slug(group or "default"))
+    run_dir = os.path.join(
+        group_dir,
         f"{_timestamp()}__{_slug(name)}__{cfg_hash(cfg)}__s{cfg.training.seed}__{_shortsha()}__{runid}",
+    )
+    return (
+        project_dir,
+        group_dir,
+        run_dir,
     )
 
 
 def write_meta(out_dir: str, cfg: JobConfig) -> None:
-    import tomli_w
+    import json
 
     meta = os.path.join(out_dir, "meta")
     os.makedirs(meta, exist_ok=True)
 
-    with open(os.path.join(meta, "config.toml"), "w") as f:
-        f.write(tomli_w.dumps(_canonical_cfg_dict(cfg)))
+    with open(os.path.join(meta, "config.json"), "w") as f:
+        json.dump(_canonical_cfg_dict(cfg), f, indent=2)
 
     # environment freeze (prefer uv)
     try:
@@ -82,3 +85,19 @@ def write_meta(out_dir: str, cfg: JobConfig) -> None:
     diff = subprocess.check_output(["git", "diff", "HEAD"]).decode()
     with open(os.path.join(meta, "git_diff.patch"), "w") as f:
         f.write(diff)
+
+
+def append_to_experiment_log(
+    project_dir: str, group_dir: str, run_dir: str, cfg: JobConfig
+) -> None:
+    # Ensure parent directories exist so appending does not fail
+    os.makedirs(project_dir, exist_ok=True)
+    os.makedirs(group_dir, exist_ok=True)
+    run_id = os.path.basename(run_dir)
+    output = f"[{_timestamp()}] {cfg.logging.wandb_run_name} / {run_id} ({cfg_hash(cfg)})\n"
+    output += f"# {cfg.logging.wandb_notes}\n"
+    output += json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":")) + "\n"
+    with open(os.path.join(project_dir, "experiment_log.txt"), "a") as f:
+        f.write(output)
+    with open(os.path.join(group_dir, "experiment_log.txt"), "a") as f:
+        f.write(output)

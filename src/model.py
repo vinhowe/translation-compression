@@ -9,7 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import inspect
 import math
-from typing import cast
+from typing import Optional, cast
 
 import torch
 import torch.nn as nn
@@ -116,27 +116,55 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        # advanced options derived
+        self.shared_token_embeddings: bool = bool(
+            getattr(config, "shared_token_embeddings", False)
+        )
+        self.use_compartment_embeddings: bool = bool(
+            getattr(config, "use_compartment_embeddings", False)
+        )
+        self.embedding_vocab_size: int = int(
+            getattr(config, "embedding_vocab_size", config.vocab_size)
+        )
+        self.base_vocab_size: Optional[int] = getattr(config, "base_vocab_size", None)
+        self.max_compartments: Optional[int] = getattr(config, "max_compartments", None)
+        self.translation_token_id: Optional[int] = getattr(
+            config, "translation_token_id", None
+        )
+        self.copy_compartment_embeddings: bool = bool(
+            getattr(config, "copy_compartment_embeddings", False)
+        )
+        self.copy_compartment_lm_head: bool = bool(
+            getattr(config, "copy_compartment_lm_head", False)
+        )
 
+        print(f"embedding_vocab_size: {self.embedding_vocab_size}")
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wte=nn.Embedding(self.embedding_vocab_size, config.n_embd),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 drop=nn.Dropout(config.dropout),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
                 ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
+        # Optional compartment embeddings (max_compartments x n_embd)
+        if self.use_compartment_embeddings:
+            assert self.max_compartments is not None, (
+                "max_compartments required when using compartment embeddings"
+            )
+            self.comp_emb = nn.Embedding(self.max_compartments, config.n_embd)
+        else:
+            self.comp_emb = None
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         if config.weight_tying:
             # with weight tying when using torch.compile() some warnings get generated:
             # "UserWarning: functional_call was passed multiple values for tied weights.
             # This behavior is deprecated and will be an error in future versions"
             # not 100% sure what this is, so far seems to be harmless. TODO investigate
-            cast(
-                nn.Module, self.transformer.wte
-            ).weight = (
-                self.lm_head.weight
-            )  # https://paperswithcode.com/method/weight-tying
+            # incompatible with shared_token_embeddings; enforced in config validation
+            cast(nn.Module, self.transformer.wte).weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -147,6 +175,48 @@ class GPT(nn.Module):
                     p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
                 )
 
+        # If configured: copy the base compartment token embeddings across all compartments
+        if (
+            not self.shared_token_embeddings
+            and self.copy_compartment_embeddings
+            and self.base_vocab_size is not None
+            and self.max_compartments is not None
+        ):
+            with torch.no_grad():
+                wte_weight: torch.Tensor = cast(
+                    nn.Embedding, self.transformer.wte
+                ).weight
+                total_expected = self.base_vocab_size * self.max_compartments + 1
+                if wte_weight.size(0) == total_expected:
+                    base = wte_weight[: self.base_vocab_size].clone()
+                    for c in range(self.max_compartments):
+                        start = c * self.base_vocab_size
+                        end = start + self.base_vocab_size
+                        wte_weight[start:end].copy_(base)
+                else:
+                    raise ValueError(
+                        f"wte_weight.size(0) != total_expected: {wte_weight.size(0)} != {total_expected}"
+                    )
+
+        # Optionally, copy the lm_head rows for base vocab across compartments (no validation/tile needed)
+        if (
+            not self.shared_token_embeddings
+            and self.copy_compartment_lm_head
+            and self.base_vocab_size is not None
+            and self.max_compartments is not None
+        ):
+            with torch.no_grad():
+                head_w: torch.Tensor = cast(nn.Linear, self.lm_head).weight
+                # lm_head shape: [vocab_size, n_embd]
+                total_expected = self.base_vocab_size * self.max_compartments + 1
+                if head_w.size(0) == total_expected:
+                    base = head_w[: self.base_vocab_size].clone()
+                    for c in range(self.max_compartments):
+                        start = c * self.base_vocab_size
+                        end = start + self.base_vocab_size
+                        head_w[start:end].copy_(base)
+                # else: skip silently per request
+
         # report number of parameters
         n_params = self.get_num_params()
         if n_params < 1e6:
@@ -154,7 +224,7 @@ class GPT(nn.Module):
         else:
             print("number of parameters: %.2fM" % (n_params / 1e6,))
 
-    def get_num_params(self, non_embedding=True):
+    def get_num_params(self, non_embedding=False):
         """
         Return the number of parameters in the model.
         For non-embedding count (default), the position embeddings get subtracted.
@@ -174,7 +244,13 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        compartment_ids: Optional[torch.Tensor] = None,
+        full_sequence_logits: bool = False,
+    ):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, (
@@ -183,28 +259,50 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
         # forward the GPT model itself
-        tok_emb = cast(nn.Embedding, self.transformer.wte)(
-            idx
-        )  # token embeddings of shape (b, t, n_embd)
+        # if using shared token embeddings, map tokens into embedding vocab via modulo for regular tokens
+        if self.shared_token_embeddings:
+            assert (
+                self.base_vocab_size is not None
+                and self.translation_token_id is not None
+            )
+            emb_vocab_last = self.embedding_vocab_size - 1
+            # modulo map into base vocab range, then put translation token to last index
+            idx_mod = torch.remainder(idx, self.base_vocab_size)
+            idx_mod = torch.where(
+                idx == self.translation_token_id,
+                torch.full_like(idx, emb_vocab_last),
+                idx_mod,
+            )
+            tok_emb = cast(nn.Embedding, self.transformer.wte)(idx_mod)
+        else:
+            tok_emb = cast(nn.Embedding, self.transformer.wte)(idx)
         pos_emb = cast(nn.Embedding, self.transformer.wpe)(
             pos
         )  # position embeddings of shape (t, n_embd)
-        x = cast(nn.Dropout, self.transformer.drop)(tok_emb + pos_emb)
+        x_input = tok_emb + pos_emb
+        if self.use_compartment_embeddings and compartment_ids is not None:
+            # compartment_ids shape (b, t)
+            comp_emb = cast(nn.Embedding, self.comp_emb)(compartment_ids)
+            x_input = x_input + comp_emb
+        x = cast(nn.Dropout, self.transformer.drop)(x_input)
         for block in cast(nn.ModuleList, self.transformer.h):
             x = block(x)
         x = cast(nn.LayerNorm, self.transformer.ln_f)(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
+        # decide how to compute logits
+        if targets is not None or full_sequence_logits:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-            )
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(
                 x[:, [-1], :]
             )  # note: using list [-1] to preserve the time dim
+        # compute loss only if targets are provided
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            )
+        else:
             loss = None
 
         return logits, loss

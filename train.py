@@ -19,14 +19,13 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import json
-import math
 import os
 import shutil
 import time
 import uuid
 import glob
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Optional, cast
 
 import numpy as np
@@ -36,8 +35,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.config.job_config import JobConfig, Model
 from src.config.manager import ConfigManager
-from src.experiment import cfg_hash, run_dir, write_meta
+from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, write_meta
 from src.model import GPT
+from src.data import UniformBatchDataLoader
+from src.assignments import write_assignments
+from src.config.presets import apply_size_tier
+from src.weights import compute_weights_map
+import struct
 
 
 def print0(*args, **kwargs):
@@ -52,7 +56,7 @@ def _peek_data_shard(filename):
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-    if header[0] != 20240520:
+    if header[0] != 20251013:
         print("ERROR: magic number mismatch in the data .bin file!")
         print("---> HINT: Are you passing in a correct file with --input_bin?")
         print(
@@ -68,11 +72,12 @@ def _load_data_shard(filename):
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[0] == 20251013, "magic number mismatch in the data .bin file"
         assert header[1] == 1, "unsupported version"
         ntok = header[2]  # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+        # the rest of it are tokens, stored as uint32
+        tokens = np.frombuffer(f.read(), dtype=np.uint32)
+    print(len(tokens), ntok)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
 
@@ -133,7 +138,286 @@ class DistributedDataLoader:
         return x, y
 
 
+class AssignmentsDataLoader:
+    def __init__(
+        self,
+        assignments_file: str,
+        filename_pattern: str,
+        B: int,
+        T: int,
+        process_rank: int,
+        num_processes: int,
+        base_vocab_size: int,
+        max_compartments: int,
+        permute_tokens: bool = False,
+        permutations_path: Optional[str] = None,
+        pin_memory: bool = True,
+    ) -> None:
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+        self.base_vocab_size = base_vocab_size
+        self.max_compartments = max_compartments
+        self.permute_tokens = permute_tokens
+        # translation token id differs by mode
+        self.translation_token_id = (
+            base_vocab_size if permute_tokens else base_vocab_size * max_compartments
+        )
+        # Optionally load permutations array of shape [max_compartments, base_vocab]
+        self._permutations: Optional[np.ndarray]
+        if self.permute_tokens:
+            if permutations_path is None or not os.path.exists(permutations_path):
+                raise FileNotFoundError(
+                    f"Permutations file not found: {permutations_path}"
+                )
+            perms = np.load(permutations_path)
+            if perms.dtype != np.int64 and perms.dtype != np.int32:
+                perms = perms.astype(np.int64)
+            if perms.shape != (max_compartments, base_vocab_size):
+                raise ValueError(
+                    f"permutations.npy shape {perms.shape} != ({max_compartments}, {base_vocab_size})"
+                )
+            self._permutations = perms
+        else:
+            self._permutations = None
+
+        # Whether to return pinned-memory CPU tensors for faster H2D copies
+        self._pin_memory = bool(pin_memory and torch.cuda.is_available())
+
+        # Load assignments header and records
+        with open(assignments_file, "rb") as f:
+            header = f.read(32)
+            magic, version, rec_size, flags, num_compartments, num_records, seed = (
+                struct.unpack("<8sBBHIQQ", header)
+            )
+            assert magic == b"TCASSIGN", "assignments magic mismatch"
+            assert version == 1 and rec_size == 8, (
+                "unsupported assignments version/record size"
+            )
+            assert num_compartments == max_compartments, (
+                f"assignments num_compartments {num_compartments} != expected {max_compartments}"
+            )
+            self._records = np.frombuffer(f.read(), dtype=np.uint64)
+        self.num_records = int(self._records.shape[0])
+
+        # Prepare token shards
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, (
+            f"did not find any files that match the pattern {filename_pattern}"
+        )
+        self.current_shard = 0
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.token_pos = 0
+        # offset per rank
+        if len(self.tokens) > (self.T + 2):
+            self.token_pos = (self.process_rank * self.T) % (
+                len(self.tokens) - (self.T + 2)
+            )
+        else:
+            self.token_pos = 0
+
+        # assignment index start (strided by world size)
+        self.assignment_idx = self.process_rank % max(1, self.num_records)
+
+    def _load_shard(self, idx: int) -> None:
+        new_idx = idx % len(self.files)
+        if new_idx != self.current_shard:
+            self.current_shard = new_idx
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        # Always reset token position when (re)loading or cycling shards,
+        # including the single-shard case where new_idx == current_shard.
+        self.token_pos = 0
+
+    def _advance_shard(self) -> None:
+        self._load_shard((self.current_shard + 1) % len(self.files))
+
+    def _read_tokens(self, n: int) -> np.ndarray:
+        out = np.empty(n, dtype=np.int32)
+        filled = 0
+        while filled < n:
+            remaining = len(self.tokens) - self.token_pos
+            if remaining <= 1:  # keep one token gap safety
+                self._advance_shard()
+                continue
+            can_take = min(n - filled, remaining)
+            out[filled : filled + can_take] = self.tokens[
+                self.token_pos : self.token_pos + can_take
+            ].astype(np.int32)
+            self.token_pos += can_take
+            filled += can_take
+            if self.token_pos >= len(self.tokens):
+                self._advance_shard()
+        return out
+
+    @staticmethod
+    def _decode_record(word: np.uint64) -> tuple[int, int, int]:
+        w = int(word)
+        kind = w & 0xFF
+        src = (w >> 16) & 0xFFFF
+        dst = (w >> 32) & 0xFFFF
+        return kind, src, dst
+
+    def reset(self) -> None:
+        self._load_shard(0)
+        self.assignment_idx = self.process_rank % max(1, self.num_records)
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        half = T // 2
+        assert T % 2 == 0 and half >= 2, "block_size must be even and >= 4"
+
+        # Allocate pinned-memory CPU tensors (if enabled) and get NumPy views for fast vectorized filling
+        x_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin_memory)
+        y_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin_memory)
+        cids_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin_memory)
+
+        x_np = x_t.numpy()
+        y_np = y_t.numpy()
+        cid_np = cids_t.numpy()
+
+        # Vectorized decode of B assignment records (strided by num_processes)
+        rec_indices = (
+            self.assignment_idx + self.num_processes * np.arange(B, dtype=np.int64)
+        ) % max(1, self.num_records)
+        words = self._records[rec_indices]
+        w = words.astype(np.uint64, copy=False)
+        kinds = (w & np.uint64(0xFF)).astype(np.int64, copy=False)
+        srcs = ((w >> np.uint64(16)) & np.uint64(0xFFFF)).astype(np.int64, copy=False)
+        dsts = ((w >> np.uint64(32)) & np.uint64(0xFFFF)).astype(np.int64, copy=False)
+
+        is_trans = kinds == 1
+        idx_trans = np.nonzero(is_trans)[0]
+        idx_comp = np.nonzero(~is_trans)[0]
+
+        # Preserve per-example token consumption order: compute sizes and a single contiguous slice
+        size_per_b = np.where(is_trans, half, T).astype(np.int64, copy=False)
+        if B == 0:
+            return x_t, y_t, cids_t
+        starts = np.zeros(B, dtype=np.int64)
+        if B > 1:
+            starts[1:] = np.cumsum(size_per_b[:-1], dtype=np.int64)
+        total_needed = int(starts[-1] + size_per_b[-1])
+        tokens_batch = self._read_tokens(total_needed).astype(np.int64, copy=False)
+
+        # Translation group: gather half-length segments in b-order
+        if idx_trans.size > 0:
+            m = int(idx_trans.size)
+            base_idx_half = np.arange(half, dtype=np.int64)[None, :]
+            trans_starts = starts[idx_trans][:, None]
+            samples = tokens_batch[trans_starts + base_idx_half]
+
+            # Prepare seq/cid for translation rows
+            seq_tr = np.empty((m, T), dtype=np.int64)
+            cid_tr = np.empty((m, T), dtype=np.int64)
+
+            # Set translation token positions and cids
+            seq_tr[:, 0] = self.translation_token_id
+            seq_tr[:, half] = self.translation_token_id
+            cid_tr[:, 0] = srcs[idx_trans]
+            cid_tr[:, half] = dsts[idx_trans]
+
+            if self.permute_tokens:
+                # Per-row permutations
+                src_maps = cast(np.ndarray, self._permutations)[
+                    srcs[idx_trans]
+                ]  # [m, base_vocab]
+                dst_maps = cast(np.ndarray, self._permutations)[
+                    dsts[idx_trans]
+                ]  # [m, base_vocab]
+                # Map tokens row-wise
+                src_tokens = np.take_along_axis(
+                    src_maps, samples[:, : half - 1], axis=1
+                )
+                dst_tokens = np.take_along_axis(
+                    dst_maps, samples[:, : half - 1], axis=1
+                )
+                seq_tr[:, 1:half] = src_tokens
+                seq_tr[:, half + 1 :] = dst_tokens
+            else:
+                base = self.base_vocab_size
+                src_offsets = srcs[idx_trans] * base
+                dst_offsets = dsts[idx_trans] * base
+                seq_tr[:, 1:half] = samples[:, : half - 1] + src_offsets[:, None]
+                seq_tr[:, half + 1 :] = samples[:, : half - 1] + dst_offsets[:, None]
+
+            # Fill cids across spans
+            cid_tr[:, 1:half] = srcs[idx_trans][:, None]
+            cid_tr[:, half + 1 :] = dsts[idx_trans][:, None]
+
+            # Targets: next-token; last is ignored
+            y_tr = np.empty_like(seq_tr)
+            y_tr[:, :-1] = seq_tr[:, 1:]
+            y_tr[:, -1] = -1
+
+            # Scatter into batch slots
+            x_np[idx_trans] = seq_tr
+            y_np[idx_trans] = y_tr
+            cid_np[idx_trans] = cid_tr
+
+        # Compartment group: gather T-length segments in b-order
+        if idx_comp.size > 0:
+            base_idx_T = np.arange(T, dtype=np.int64)[None, :]
+            comp_starts = starts[idx_comp][:, None]
+            samples = tokens_batch[comp_starts + base_idx_T]
+
+            if self.permute_tokens:
+                src_maps = cast(np.ndarray, self._permutations)[
+                    srcs[idx_comp]
+                ]  # [n, base_vocab]
+                x_comp = np.take_along_axis(src_maps, samples, axis=1)
+            else:
+                base = self.base_vocab_size
+                src_offsets = srcs[idx_comp] * base
+                x_comp = samples + src_offsets[:, None]
+
+            y_comp = np.empty_like(x_comp)
+            y_comp[:, :-1] = x_comp[:, 1:]
+            y_comp[:, -1] = -1
+
+            x_np[idx_comp] = x_comp
+            y_np[idx_comp] = y_comp
+            cid_np[idx_comp, :] = srcs[idx_comp][:, None]
+
+        # advance assignment pointer for next batch
+        self.assignment_idx = (
+            self.assignment_idx + self.num_processes * B
+        ) % self.num_records
+
+        # Optional runtime invariants for debugging. Enable with TC_DEBUG_LOADER=1
+        if os.environ.get("TC_DEBUG_LOADER", "") == "1":
+            assert (
+                x_np.shape == (B, T) and y_np.shape == (B, T) and cid_np.shape == (B, T)
+            )
+            assert (y_np[:, -1] == -1).all()
+            if B > 0 and T > 1:
+                assert (y_np[:, :-1] == x_np[:, 1:]).all()
+            if idx_trans.size > 0:
+                assert (x_np[idx_trans, 0] == self.translation_token_id).all()
+                assert (x_np[idx_trans, half] == self.translation_token_id).all()
+            # Basic bounds checking of vocab id space
+            if self.permute_tokens:
+                # Permuted mode uses base vocab ids and a single translation token at base_vocab_size
+                assert (x_np >= 0).all()
+                assert (x_np < (self.base_vocab_size + 1)).all()
+            else:
+                max_vocab = self.base_vocab_size * self.max_compartments + 1
+                assert (x_np >= 0).all() and (x_np < max_vocab).all()
+
+        return x_t, y_t, cids_t
+
+
+STORAGE_ROOT = "/nobackup/archive/grp/grp_pccl/vin/dev/translation-compression"
+
+
 def main(config: JobConfig) -> None:
+    # Apply size tier overrides (if provided) and mirror assignment_seed to training.seed
+    config = apply_size_tier(config)
+    config = replace(
+        config,
+        experiment=replace(config.experiment, assignment_seed=config.training.seed),
+    )
     # -----------------------------------------------------------------------------
     # Unpack config into local variables (matches original script expectations)
     # wandb logging
@@ -142,10 +426,11 @@ def main(config: JobConfig) -> None:
     wandb_run_name = config.logging.wandb_run_name
     wandb_group = config.logging.wandb_group
     wandb_notes = config.logging.wandb_notes
-    # I/O: structured run directory
+    # I/O: structured run directory under hardcoded storage root
     run_id = os.environ.get("RUN_ID", uuid.uuid4().hex[:8])
-    out_dir = run_dir(
-        config.logging.log_folder,
+    out_root = os.path.join(STORAGE_ROOT, "out")
+    project_dir, group_dir, out_dir = run_dirs(
+        out_root,
         wandb_project,
         wandb_group,
         wandb_run_name,
@@ -174,10 +459,10 @@ def main(config: JobConfig) -> None:
     beta2 = config.optimizer.beta2
     grad_clip = config.optimizer.grad_clip
     # learning rate decay settings
-    decay_lr = config.lr.decay_lr
+    # decay_lr = config.lr.decay_lr
     warmup_iters = config.lr.warmup_iters
-    lr_decay_iters = config.lr.lr_decay_iters
-    min_lr = config.lr.min_lr
+    # lr_decay_iters = config.lr.lr_decay_iters
+    # min_lr = config.lr.min_lr
     # DDP settings
     backend = config.distributed.backend
     # system
@@ -219,12 +504,204 @@ def main(config: JobConfig) -> None:
     tokens_per_iter = (
         gradient_accumulation_steps * ddp_world_size * batch_size * block_size
     )
-    print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    print(
+        f"tokens per iteration will be: gradient_accumulation_steps={gradient_accumulation_steps} * ddp_world_size={ddp_world_size} * batch_size={batch_size} * block_size={block_size} = {tokens_per_iter:,}"
+    )
+    # Effective global batch size across all processes and gradient accumulation
+    effective_batch_size = gradient_accumulation_steps * ddp_world_size * batch_size
+
+    # Restrict checkpointing to these specific global steps only (reverse engineering
+    # Morris figure)
+    checkpoint_steps = {
+        100,
+        850,
+        3500,
+        7000,
+        14000,
+        29000,
+        60000,
+        120000,
+        240000,
+        500000,
+        1000000,
+    }
+
+    assignments_path = os.path.join(out_dir, "assignments.bin")
+    permutations_path = os.path.join(out_dir, "permutations.npy")
+    training_seed = config.training.seed + seed_offset
+    # Determine data source
+    use_pretokenized = config.data.source == "pretokenized"
+
+    # If using pretokenized data, compute deterministic cache paths for assignments/permutations
+    if use_pretokenized:
+        # Cache directory under the same hardcoded storage root
+        cache_root = os.path.join(STORAGE_ROOT, "cache")
+        exp = config.experiment
+        if exp.max_compartments is None:
+            raise ValueError("experiment.max_compartments is required")
+        max_compartments_int = cast(int, exp.max_compartments)
+        total_examples = config.training.max_iters * effective_batch_size
+
+        # Format float safely for filenames
+        def _fmt_float(x: float) -> str:
+            s = f"{x:.6g}".rstrip("0").rstrip(".")
+            return s.replace(".", "p") if "." in s else s
+
+        # Build description from inputs to assignments creation
+        assignments_desc = (
+            f"n{exp.n_compartments}_t{_fmt_float(max(0.0, float(exp.translation_ratio)))}_"
+            f"sc{exp.compartment_scaling}_total{total_examples}_"
+            f"maxc{max_compartments_int}_seed{int(training_seed)}"
+        )
+        # Point assignments_path to cached file
+        assignments_path = os.path.join(
+            cache_root, f"assignments_{assignments_desc}.bin"
+        )
+
+        # If permuting tokens per compartment, also compute cached permutations path
+        if exp.permute_tokens_per_compartment:
+            if config.model.vocab_size is not None:
+                base_vocab_int = cast(int, config.model.vocab_size)
+                perms_desc = f"basev{base_vocab_int}_maxc{max_compartments_int}_seed{int(training_seed)}"
+                permutations_path = os.path.join(
+                    cache_root, f"permutations_{perms_desc}.npy"
+                )
 
     if master_process:
         os.makedirs(os.path.join(out_dir, "checkpoints"), exist_ok=True)
         write_meta(out_dir, config)
-    torch.manual_seed(config.training.seed + seed_offset)
+        append_to_experiment_log(project_dir, group_dir, out_dir, config)
+        # Generate assignments/permutations only for pretokenized source
+        if use_pretokenized:
+            exp = config.experiment
+            try:
+                if exp.max_compartments is None:
+                    raise ValueError("experiment.max_compartments is required")
+                max_compartments_int = cast(int, exp.max_compartments)
+                total_examples = config.training.max_iters * effective_batch_size
+                # Ensure cache directory exists
+                cache_root = os.path.dirname(assignments_path)
+                os.makedirs(cache_root, exist_ok=True)
+                # Assignments: write only if not already cached, with simple cross-process locking
+                if not os.path.exists(assignments_path):
+                    lock_path = assignments_path + ".lock"
+                    tmp_path = assignments_path + f".tmp.{os.getpid()}"
+                    acquired = False
+                    while True:
+                        try:
+                            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                            os.close(fd)
+                            acquired = True
+                            break
+                        except FileExistsError:
+                            # Another process is writing; wait until file appears
+                            if os.path.exists(assignments_path):
+                                break
+                            time.sleep(0.1)
+                    if acquired:
+                        try:
+                            write_assignments(
+                                tmp_path,
+                                weights_map=compute_weights_map(
+                                    n=exp.n_compartments,
+                                    t=max(0.0, float(exp.translation_ratio)),
+                                    scaling=exp.compartment_scaling,
+                                ),
+                                total_examples=total_examples,
+                                max_compartments=max_compartments_int,
+                                seed=training_seed,
+                                no_shuffle=False,
+                            )
+                            os.replace(tmp_path, assignments_path)
+                            print0(
+                                f"Wrote assignments to {assignments_path} with total_examples={total_examples:,}"
+                            )
+                        finally:
+                            try:
+                                if os.path.exists(tmp_path):
+                                    os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            try:
+                                os.remove(lock_path)
+                            except Exception:
+                                pass
+                    else:
+                        print0(f"Using cached assignments at {assignments_path}")
+                else:
+                    print0(f"Using cached assignments at {assignments_path}")
+                # If enabled, also create deterministic per-compartment permutations of base tokens
+                if exp.permute_tokens_per_compartment:
+                    if config.model.vocab_size is None:
+                        raise ValueError(
+                            "model.vocab_size (base) must be set to create permutations"
+                        )
+                    base_vocab_int = cast(int, config.model.vocab_size)
+                    # Permutations: write only if not already cached, with simple cross-process locking
+                    if not os.path.exists(permutations_path):
+                        lock_path = permutations_path + ".lock"
+                        tmp_path = permutations_path + f".tmp.{os.getpid()}"
+                        acquired = False
+                        while True:
+                            try:
+                                fd = os.open(
+                                    lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR
+                                )
+                                os.close(fd)
+                                acquired = True
+                                break
+                            except FileExistsError:
+                                # Another process is writing; wait until file appears
+                                if os.path.exists(permutations_path):
+                                    break
+                                time.sleep(0.1)
+                        if acquired:
+                            try:
+                                # Use SeedSequence to spawn deterministic child RNGs per compartment
+                                ss = np.random.SeedSequence(
+                                    int(training_seed) & 0xFFFFFFFFFFFFFFFF
+                                )
+                                child_seeds = ss.spawn(max_compartments_int)
+                                # Allocate permutations for all compartments up to max_compartments
+                                perms = np.empty(
+                                    (int(max_compartments_int), base_vocab_int),
+                                    dtype=np.int64,
+                                )
+                                for c, child_ss in enumerate(child_seeds):
+                                    gen = np.random.Generator(np.random.PCG64(child_ss))
+                                    perms[c] = gen.permutation(base_vocab_int).astype(
+                                        np.int64
+                                    )
+                                # Write using a file handle to avoid numpy appending an extra .npy
+                                with open(tmp_path, "wb") as f:
+                                    np.save(f, perms)
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                os.replace(tmp_path, permutations_path)
+                                print0(
+                                    f"Wrote per-compartment permutations to {permutations_path} with shape {perms.shape}"
+                                )
+                            finally:
+                                try:
+                                    if os.path.exists(tmp_path):
+                                        os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                                try:
+                                    os.remove(lock_path)
+                                except Exception:
+                                    pass
+                        else:
+                            print0(f"Using cached permutations at {permutations_path}")
+                    else:
+                        print0(f"Using cached permutations at {permutations_path}")
+            except Exception as e:
+                print0(f"Failed generating assignments: {e}")
+                raise
+    # Ensure all processes wait for assignments/permutations if using pretokenized data
+    if ddp and use_pretokenized:
+        torch.distributed.barrier()
+    torch.manual_seed(training_seed)
     torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
     device_type = (
@@ -249,26 +726,32 @@ def main(config: JobConfig) -> None:
     # model init
     model: torch.nn.Module
     checkpoint: Optional[dict[str, Any]] = None
-    if init_from == "scratch":
-        # init a new model from scratch
-        print("Initializing a new model from scratch")
-        # determine the vocab size we'll use for from-scratch training
-        vocab = config.model.vocab_size
-        if vocab is None:
-            print(
-                "defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)"
-            )
-        gptconf = Model(
-            **{
-                **asdict(config.model),
-                "vocab_size": vocab,
-            }
+    # Compute composite vocabulary
+    exp_cfg = config.experiment
+    if exp_cfg.max_compartments is None:
+        raise ValueError("experiment.max_compartments is required")
+    base_vocab = config.model.vocab_size
+    if base_vocab is None:
+        raise ValueError(
+            "model.vocab_size (base) must be set for composite vocab computation"
         )
-        model = GPT(gptconf)
-    elif init_from == "resume":
-        print(f"Resuming training from {out_dir}")
-        # resume training from a checkpoint.
-        ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    # If permuting per compartment, vocabulary is base_vocab + 1 (only translation token)
+    # Otherwise, it's base_vocab * max_compartments + 1 (offset scheme)
+    composite_vocab = (
+        base_vocab + 1
+        if exp_cfg.permute_tokens_per_compartment
+        else base_vocab * cast(int, exp_cfg.max_compartments) + 1
+    )
+    # Translation token id differs by mode
+    translation_token_id_cfg = (
+        base_vocab
+        if exp_cfg.permute_tokens_per_compartment
+        else base_vocab * cast(int, exp_cfg.max_compartments)
+    )
+    # Auto-resume from checkpoint if present; else allow gpt2 init; else scratch
+    ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    if os.path.exists(ckpt_path):
+        print(f"Resuming training from checkpoint: {ckpt_path}")
         checkpoint = cast(dict[str, Any], torch.load(ckpt_path, map_location=device))
         checkpoint_model_args: dict[str, Any] = checkpoint["model_args"]
         # create the model from checkpoint args
@@ -283,13 +766,50 @@ def main(config: JobConfig) -> None:
         model.load_state_dict(state_dict)
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
-    elif init_from.startswith("gpt2"):
-        print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-        # initialize from OpenAI GPT-2 weights
-        override_args = dict(dropout=dropout)
-        model = GPT.from_pretrained(init_from, override_args)
     else:
-        raise ValueError(f"Unknown init_from setting: {init_from}")
+        # init a new model from scratch
+        print("Initializing a new model from scratch")
+        # determine the vocab size we'll use for from-scratch training
+        vocab = composite_vocab
+        gptconf = Model(
+            **{
+                **asdict(config.model),
+                "vocab_size": vocab,
+                # pass advanced options to model
+                "embedding_vocab_size": (
+                    (base_vocab + 1)
+                    if config.experiment.shared_token_embeddings
+                    else vocab
+                ),
+                "shared_token_embeddings": bool(
+                    config.experiment.shared_token_embeddings
+                ),
+                "use_compartment_embeddings": bool(
+                    config.experiment.use_compartment_embeddings
+                ),
+                # When permuting per-compartment, copying compartment weights is a no-op and shape-incompatible
+                "copy_compartment_embeddings": (
+                    False
+                    if exp_cfg.permute_tokens_per_compartment
+                    else bool(config.experiment.copy_compartment_embeddings)
+                ),
+                "copy_compartment_lm_head": (
+                    False
+                    if exp_cfg.permute_tokens_per_compartment
+                    else bool(config.experiment.copy_compartment_lm_head)
+                ),
+                "base_vocab_size": base_vocab,
+                "max_compartments": cast(int, exp_cfg.max_compartments),
+                "translation_token_id": translation_token_id_cfg,
+                # disable weight tying if shared embeddings are used (validated elsewhere)
+                "weight_tying": (
+                    False
+                    if config.experiment.shared_token_embeddings
+                    else config.model.weight_tying
+                ),
+            }
+        )
+        model = GPT(gptconf)
     # crop down the model block size if desired, using model surgery
     if isinstance(model, GPT) and block_size < model.config.block_size:
         model.crop_block_size(block_size)
@@ -302,35 +822,68 @@ def main(config: JobConfig) -> None:
     optimizer = model.configure_optimizers(
         weight_decay, learning_rate, (beta1, beta2), device_type
     )
-    if init_from == "resume" and checkpoint is not None:
+    if checkpoint is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])  # pyright: ignore[reportArgumentType]
     checkpoint = None  # free up memory
 
     # compile the model
     if compile:
         print("compiling the model... (takes a ~minute)")
+        # model = cast(torch.nn.Module, torch.compile(model, mode="max-autotune"))  # requires PyTorch 2.0
         model = cast(torch.nn.Module, torch.compile(model))  # requires PyTorch 2.0
 
     # wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])  # pyright: ignore[reportPossiblyUnboundVariable]
 
-    train_loader = DistributedDataLoader(
-        train_bin,
-        batch_size,
-        block_size,
-        ddp_rank or 0,
-        ddp_world_size,
-    )
-    val_loader = None
-    if val_bin:
-        val_loader = DistributedDataLoader(
-            val_bin,
+    # Data loaders: pretokenized assignments-based vs uniform synthetic
+    if use_pretokenized:
+        # Custom assignments-driven dataloader that transforms tokens per assignments.bin
+        train_loader = AssignmentsDataLoader(
+            assignments_path,
+            train_bin,
             batch_size,
             block_size,
             ddp_rank or 0,
             ddp_world_size,
+            base_vocab,
+            cast(int, exp_cfg.max_compartments),
+            permute_tokens=exp_cfg.permute_tokens_per_compartment,
+            permutations_path=(
+                permutations_path if exp_cfg.permute_tokens_per_compartment else None
+            ),
         )
+        val_loader = None
+        if val_bin:
+            val_loader = AssignmentsDataLoader(
+                assignments_path,
+                val_bin,
+                batch_size,
+                block_size,
+                ddp_rank or 0,
+                ddp_world_size,
+                base_vocab,
+                cast(int, exp_cfg.max_compartments),
+                permute_tokens=exp_cfg.permute_tokens_per_compartment,
+                permutations_path=(
+                    permutations_path
+                    if exp_cfg.permute_tokens_per_compartment
+                    else None
+                ),
+            )
+    else:
+        # Uniform synthetic stream for quick debugging
+        train_loader = UniformBatchDataLoader(
+            B=batch_size,
+            T=block_size,
+            vocab_size=composite_vocab,
+            seed=config.data.uniform_seed + training_seed,
+            process_rank=ddp_rank or 0,
+            num_processes=ddp_world_size,
+            return_compartment_ids=bool(exp_cfg.use_compartment_embeddings),
+            pin_memory=True,
+        )
+        val_loader = None
 
     # helps estimate an arbitrarily accurate loss over either split using many batches
     @torch.no_grad()
@@ -340,38 +893,64 @@ def main(config: JobConfig) -> None:
         out = {}
         model.eval()
         for split in ["train", "val"]:
+            # Reset the validation data loader to ensure deterministic eval on the same
+            # data
+            if split == "val":
+                val_loader.reset()
             losses = torch.zeros(eval_iters)
             for k in range(eval_iters):
-                X, Y = val_loader.next_batch()
-                X, Y = X.to(device), Y.to(device)
+                batch = val_loader.next_batch()
+                if isinstance(batch, tuple) and len(batch) == 3:
+                    X, Y, Cval = batch
+                else:
+                    X, Y = batch  # type: ignore[misc]
+                    Cval = None
+                X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
+                Cval = Cval.to(device, non_blocking=True) if Cval is not None else None
                 with ctx:
-                    logits, loss = model(X, Y)
+                    # mark cudagraph step begin if available to avoid output overwrite
+                    torch.compiler.cudagraph_mark_step_begin()
+                    logits, loss = model(X, Y, compartment_ids=Cval)
                 losses[k] = loss.item()
             out[split] = losses.mean()
         model.train()
         return out
 
-    # learning rate decay scheduler (cosine with warmup)
+    # # learning rate decay scheduler (cosine with warmup)
+    # def get_lr(it):
+    #     # 1) linear warmup for warmup_iters steps
+    #     if it < warmup_iters:
+    #         return learning_rate * (it + 1) / (warmup_iters + 1)
+    #     # 2) if it > lr_decay_iters, return min learning rate
+    #     if it > lr_decay_iters:
+    #         return min_lr
+    #     # 3) in between, use cosine decay down to min learning rate
+    #     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    #     assert 0 <= decay_ratio <= 1
+    #     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    #     return min_lr + coeff * (learning_rate - min_lr)
+
+    # learning rate decay scheduler (warmup and no decay)
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < warmup_iters:
             return learning_rate * (it + 1) / (warmup_iters + 1)
-        # 2) if it > lr_decay_iters, return min learning rate
-        if it > lr_decay_iters:
-            return min_lr
-        # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
-        return min_lr + coeff * (learning_rate - min_lr)
+        # 2) if it > lr_decay_iters, return target learning rate
+        return learning_rate
 
     # logging
+    wandb_run: Optional[Any] = None
     if wandb_log and master_process:
         import wandb
 
-        wandb.init(
+        name_value: Optional[str] = None
+        if isinstance(wandb_run_name, str):
+            _nm = wandb_run_name.strip()
+            if _nm and _nm.lower() != "sweep":
+                name_value = wandb_run_name
+
+        wandb_run = wandb.init(
             project=wandb_project,
-            name=wandb_run_name,
             group=wandb_group,
             notes=wandb_notes,
             config={
@@ -381,11 +960,20 @@ def main(config: JobConfig) -> None:
                 **asdict(config),
             },
             dir=out_dir,
+            id=run_id,
+            resume="allow",
+            name=name_value,
         )
 
     # training loop
-    X, Y = train_loader.next_batch()  # fetch the very first batch
-    X, Y = X.to(device), Y.to(device)
+    batch0 = train_loader.next_batch()  # fetch the very first batch
+    if isinstance(batch0, tuple) and len(batch0) == 3:
+        X, Y, C = batch0
+    else:
+        X, Y = batch0  # type: ignore[misc]
+        C = None
+    X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
+    C = C.to(device, non_blocking=True) if C is not None else None
     t0 = time.time()
     local_iter_num = 0  # number of iterations in the lifetime of this process
     raw_model: GPT = (
@@ -394,7 +982,8 @@ def main(config: JobConfig) -> None:
     running_mfu = -1.0
     while True:
         # determine and set the learning rate for this iteration
-        lr = get_lr(iter_num) if decay_lr else learning_rate
+        # lr = get_lr(iter_num) if decay_lr else learning_rate
+        lr = get_lr(iter_num)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -416,43 +1005,40 @@ def main(config: JobConfig) -> None:
                             "val/loss": losses["val"],
                             "lr": lr,
                             "mfu": running_mfu * 100,  # convert to percentage
-                        }
+                        },
+                        step=iter_num,
                     )
-            if (
-                losses is not None and losses["val"] < best_val_loss
-            ) or always_save_checkpoint:
-                if losses is not None:
-                    best_val_loss = losses["val"]
-                if iter_num > 0:
-                    ck_root = os.path.join(out_dir, "checkpoints")
-                    step_dir = os.path.join(ck_root, f"step-{iter_num:06d}")
-                    os.makedirs(step_dir, exist_ok=True)
-                    torch.save(
-                        raw_model.state_dict(), os.path.join(step_dir, "model.pt")
-                    )
-                    torch.save(
-                        optimizer.state_dict(), os.path.join(step_dir, "optimizer.pt")
-                    )
-                    with open(os.path.join(step_dir, "trainer_state.json"), "w") as f:
-                        json.dump(
-                            {
-                                "iter_num": iter_num,
-                                "best_val_loss": float(best_val_loss),
-                            },
-                            f,
-                        )
-                    latest = os.path.join(ck_root, "latest")
-                    try:
-                        if os.path.islink(latest) or os.path.exists(latest):
-                            if os.path.islink(latest):
-                                os.unlink(latest)
-                            else:
-                                shutil.rmtree(latest)
-                        os.symlink(os.path.basename(step_dir), latest)
-                    except Exception:
-                        pass
-                    print(f"saving checkpoint to {step_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+            if losses is not None and losses["val"] < best_val_loss:
+                best_val_loss = losses["val"]
+
+        # Save checkpoints only at explicitly specified steps
+        if (
+            master_process
+            and (iter_num % eval_interval == 0 or iter_num in checkpoint_steps)
+            and iter_num > 0
+        ):
+            ck_root = os.path.join(out_dir, "checkpoints")
+            step_dir = os.path.join(ck_root, f"step-{iter_num:06d}")
+            os.makedirs(step_dir, exist_ok=True)
+            with open(os.path.join(step_dir, "trainer_state.json"), "w") as f:
+                json.dump(
+                    {
+                        "iter_num": iter_num,
+                        "best_val_loss": float(best_val_loss),
+                    },
+                    f,
+                )
+            latest = os.path.join(ck_root, "latest")
+            if os.path.islink(latest) or os.path.exists(latest):
+                if os.path.islink(latest):
+                    os.unlink(latest)
+                else:
+                    shutil.rmtree(latest)
+            os.symlink(os.path.basename(step_dir), latest)
+            print(f"saving checkpoint to {step_dir}")
+            torch.save(raw_model.state_dict(), os.path.join(step_dir, "model.pt"))
+            torch.save(optimizer.state_dict(), os.path.join(step_dir, "optimizer.pt"))
+
         if iter_num == 0 and eval_only:
             break
 
@@ -469,14 +1055,21 @@ def main(config: JobConfig) -> None:
                     micro_step == gradient_accumulation_steps - 1
                 )
             with ctx:
-                logits, loss = model(X, Y)
+                torch.compiler.cudagraph_mark_step_begin()
+                logits, loss = model(X, Y, compartment_ids=C)
                 loss = (
                     loss / gradient_accumulation_steps
                 )  # scale the loss to account for gradient accumulation
             last_loss = loss
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = train_loader.next_batch()
-            X, Y = X.to(device), Y.to(device)
+            batch = train_loader.next_batch()
+            if isinstance(batch, tuple) and len(batch) == 3:
+                X, Y, C = batch
+            else:
+                X, Y = batch  # type: ignore[misc]
+                C = None
+            X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
+            C = C.to(device, non_blocking=True) if C is not None else None
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
         # clip the gradient
@@ -517,7 +1110,8 @@ def main(config: JobConfig) -> None:
                         "lr": lr,
                         "mfu": running_mfu * 100,
                         "time_ms": dt * 1000,
-                    }
+                    },
+                    step=iter_num,
                 )
         iter_num += 1
         local_iter_num += 1
