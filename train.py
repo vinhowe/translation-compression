@@ -151,6 +151,7 @@ class AssignmentsDataLoader:
         max_compartments: int,
         permute_tokens: bool = False,
         permutations_path: Optional[str] = None,
+        permute_inputs: bool = True,
         pin_memory: bool = True,
     ) -> None:
         self.process_rank = process_rank
@@ -160,6 +161,7 @@ class AssignmentsDataLoader:
         self.base_vocab_size = base_vocab_size
         self.max_compartments = max_compartments
         self.permute_tokens = permute_tokens
+        self.permute_inputs = permute_inputs
         # translation token id differs by mode
         self.translation_token_id = (
             base_vocab_size if permute_tokens else base_vocab_size * max_compartments
@@ -174,10 +176,17 @@ class AssignmentsDataLoader:
             perms = np.load(permutations_path)
             if perms.dtype != np.int64 and perms.dtype != np.int32:
                 perms = perms.astype(np.int64)
-            if perms.shape != (max_compartments, base_vocab_size):
+            rows, cols = perms.shape
+            if cols != base_vocab_size:
                 raise ValueError(
-                    f"permutations.npy shape {perms.shape} != ({max_compartments}, {base_vocab_size})"
+                    f"permutations.npy base vocab mismatch: {cols} != {base_vocab_size}"
                 )
+            if rows < max_compartments:
+                raise ValueError(
+                    f"permutations.npy compartments {rows} < required {max_compartments}"
+                )
+            if rows > max_compartments:
+                perms = perms[:max_compartments]
             self._permutations = perms
         else:
             self._permutations = None
@@ -308,13 +317,16 @@ class AssignmentsDataLoader:
             trans_starts = starts[idx_trans][:, None]
             samples = tokens_batch[trans_starts + base_idx_half]
 
-            # Prepare seq/cid for translation rows
-            seq_tr = np.empty((m, T), dtype=np.int64)
+            # Prepare input/output seq and cids for translation rows
+            seq_in = np.empty((m, T), dtype=np.int64)
+            seq_out = np.empty((m, T), dtype=np.int64)
             cid_tr = np.empty((m, T), dtype=np.int64)
 
-            # Set translation token positions and cids
-            seq_tr[:, 0] = self.translation_token_id
-            seq_tr[:, half] = self.translation_token_id
+            # Set translation token positions and cids (same for input/output)
+            seq_in[:, 0] = self.translation_token_id
+            seq_in[:, half] = self.translation_token_id
+            seq_out[:, 0] = self.translation_token_id
+            seq_out[:, half] = self.translation_token_id
             cid_tr[:, 0] = srcs[idx_trans]
             cid_tr[:, half] = dsts[idx_trans]
 
@@ -326,33 +338,40 @@ class AssignmentsDataLoader:
                 dst_maps = cast(np.ndarray, self._permutations)[
                     dsts[idx_trans]
                 ]  # [m, base_vocab]
-                # Map tokens row-wise
-                src_tokens = np.take_along_axis(
-                    src_maps, samples[:, : half - 1], axis=1
-                )
-                dst_tokens = np.take_along_axis(
-                    dst_maps, samples[:, : half - 1], axis=1
-                )
-                seq_tr[:, 1:half] = src_tokens
-                seq_tr[:, half + 1 :] = dst_tokens
+                # Map tokens row-wise once
+                perm_src = np.take_along_axis(src_maps, samples[:, : half - 1], axis=1)
+                perm_dst = np.take_along_axis(dst_maps, samples[:, : half - 1], axis=1)
+                # Inputs: optionally permuted
+                if self.permute_inputs:
+                    seq_in[:, 1:half] = perm_src
+                    seq_in[:, half + 1 :] = perm_dst
+                else:
+                    seq_in[:, 1:half] = samples[:, : half - 1]
+                    seq_in[:, half + 1 :] = samples[:, : half - 1]
+                # Targets: always in permuted space
+                seq_out[:, 1:half] = perm_src
+                seq_out[:, half + 1 :] = perm_dst
             else:
                 base = self.base_vocab_size
                 src_offsets = srcs[idx_trans] * base
                 dst_offsets = dsts[idx_trans] * base
-                seq_tr[:, 1:half] = samples[:, : half - 1] + src_offsets[:, None]
-                seq_tr[:, half + 1 :] = samples[:, : half - 1] + dst_offsets[:, None]
+                seq_in[:, 1:half] = samples[:, : half - 1] + src_offsets[:, None]
+                seq_in[:, half + 1 :] = samples[:, : half - 1] + dst_offsets[:, None]
+                # Without permutation, inputs and outputs are identical
+                seq_out[:, 1:half] = seq_in[:, 1:half]
+                seq_out[:, half + 1 :] = seq_in[:, half + 1 :]
 
             # Fill cids across spans
             cid_tr[:, 1:half] = srcs[idx_trans][:, None]
             cid_tr[:, half + 1 :] = dsts[idx_trans][:, None]
 
             # Targets: next-token; last is ignored
-            y_tr = np.empty_like(seq_tr)
-            y_tr[:, :-1] = seq_tr[:, 1:]
+            y_tr = np.empty_like(seq_out)
+            y_tr[:, :-1] = seq_out[:, 1:]
             y_tr[:, -1] = -1
 
             # Scatter into batch slots
-            x_np[idx_trans] = seq_tr
+            x_np[idx_trans] = seq_in
             y_np[idx_trans] = y_tr
             cid_np[idx_trans] = cid_tr
 
@@ -366,15 +385,23 @@ class AssignmentsDataLoader:
                 src_maps = cast(np.ndarray, self._permutations)[
                     srcs[idx_comp]
                 ]  # [n, base_vocab]
-                x_comp = np.take_along_axis(src_maps, samples, axis=1)
+                perm_samples = np.take_along_axis(src_maps, samples, axis=1)
+                # Inputs: optionally permuted
+                if self.permute_inputs:
+                    x_comp = perm_samples
+                else:
+                    x_comp = samples
+                # Targets: always in permuted space
+                y_comp = np.empty_like(perm_samples)
+                y_comp[:, :-1] = perm_samples[:, 1:]
+                y_comp[:, -1] = -1
             else:
                 base = self.base_vocab_size
                 src_offsets = srcs[idx_comp] * base
                 x_comp = samples + src_offsets[:, None]
-
-            y_comp = np.empty_like(x_comp)
-            y_comp[:, :-1] = x_comp[:, 1:]
-            y_comp[:, -1] = -1
+                y_comp = np.empty_like(x_comp)
+                y_comp[:, :-1] = x_comp[:, 1:]
+                y_comp[:, -1] = -1
 
             x_np[idx_comp] = x_comp
             y_np[idx_comp] = y_comp
@@ -391,7 +418,11 @@ class AssignmentsDataLoader:
                 x_np.shape == (B, T) and y_np.shape == (B, T) and cid_np.shape == (B, T)
             )
             assert (y_np[:, -1] == -1).all()
-            if B > 0 and T > 1:
+            if (
+                B > 0
+                and T > 1
+                and not (self.permute_tokens and not self.permute_inputs)
+            ):
                 assert (y_np[:, :-1] == x_np[:, 1:]).all()
             if idx_trans.size > 0:
                 assert (x_np[idx_trans, 0] == self.translation_token_id).all()
@@ -852,6 +883,7 @@ def main(config: JobConfig) -> None:
             permutations_path=(
                 permutations_path if exp_cfg.permute_tokens_per_compartment else None
             ),
+            permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
         )
         val_loader = None
         if val_bin:
@@ -870,6 +902,7 @@ def main(config: JobConfig) -> None:
                     if exp_cfg.permute_tokens_per_compartment
                     else None
                 ),
+                permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
             )
     else:
         # Uniform synthetic stream for quick debugging

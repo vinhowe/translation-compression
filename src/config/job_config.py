@@ -163,6 +163,10 @@ class Experiment:
     # vocab becomes base_vocab+1 (translation token only) and tokens are mapped
     # through a seeded permutation per compartment at data loading time.
     permute_tokens_per_compartment: bool = True
+    # When permuting tokens per compartment, controls whether model *inputs* are
+    # also permuted. If False, inputs use the unpermuted base tokens while
+    # targets remain in the permuted id space.
+    permute_input_tokens_per_compartment: bool = True
 
 
 @dataclass(frozen=True)
