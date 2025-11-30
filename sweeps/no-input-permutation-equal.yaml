@@ -1,0 +1,22 @@
+method: grid
+name: no-input-permutation-equal
+project: translation-compression
+program: train.py
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --job.config-file
+  - ./config/sweep-no-permute-inputs-fineweb.toml
+  - ${args}
+parameters:
+  model.size_tier:
+    values: ["8-32", "8-64", "8-128", "8-256"]
+  training.seed:
+    values: [64]
+  experiment.n_compartments:
+    values: [2, 4, 8, 16]
+  experiment.translation_ratio:
+    values: [0, 0.5, 1.0]
+  experiment.use_compartment_embeddings:
+    values: [true, false]

@@ -1,0 +1,43 @@
+[data]
+train_bin = "data/fineweb350B-dedup-suffix-31/fineweb350b-dedup_train_*.bin"
+val_bin = "data/fineweb350B-dedup-suffix-31/fineweb350b-dedup_val_*.bin"
+
+[model]
+block_size = 64
+vocab_size = 151936
+weight_tying = false
+# size_tier set via sweep; n_layer/n_embd/n_head derived; batch/accum derived
+
+[training]
+max_iters = 1e6
+eval_interval = 10000
+eval_iters = 1
+log_interval = 10
+always_save_checkpoints = true
+# batch_size and gradient_accumulation_steps set by size_tier
+# seed set via sweep
+
+[optimizer]
+learning_rate = 2e-5
+weight_decay = 0
+
+[system]
+compile = true
+dtype = "bfloat16"
+
+[logging]
+wandb_log = true
+wandb_project = "translation-compression"
+wandb_run_name = "sweep"
+wandb_notes = "No input permutation, equal compartment scaling"
+wandb_group = "no-input-permutation-equal"
+
+[experiment]
+n_compartments = 1
+compartment_scaling = "equal"
+translation_ratio = 0
+max_compartments = 128
+# assignment_seed mirrors training.seed in code
+use_compartment_embeddings = true
+permute_tokens_per_compartment = true
+permute_input_tokens_per_compartment = false
