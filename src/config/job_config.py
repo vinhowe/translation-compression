@@ -1,6 +1,8 @@
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
+from tyro.conf import FlagConversionOff
+
 
 @dataclass(frozen=True)
 class Job:
@@ -151,22 +153,22 @@ class Experiment:
     # Advanced options
     # If true, use one shared token embedding table of size base_vocab+1 and map inputs
     # modulo base_vocab
-    shared_token_embeddings: bool = False
+    shared_token_embeddings: FlagConversionOff[bool] = False
     # If true, add a learned compartment embedding (max_compartments x n_embd) to
     # token+pos embeddings
-    use_compartment_embeddings: bool = False
+    use_compartment_embeddings: FlagConversionOff[bool] = False
     # If true and not using shared_token_embeddings, clone base token embeddings
     # across compartments during initialization (model-side behavior).
-    copy_compartment_embeddings: bool = False
-    copy_compartment_lm_head: bool = False
+    copy_compartment_embeddings: FlagConversionOff[bool] = False
+    copy_compartment_lm_head: FlagConversionOff[bool] = False
     # If true, use per-compartment permutations of base tokens. Model/tokenizer
     # vocab becomes base_vocab+1 (translation token only) and tokens are mapped
     # through a seeded permutation per compartment at data loading time.
-    permute_tokens_per_compartment: bool = True
+    permute_tokens_per_compartment: FlagConversionOff[bool] = True
     # When permuting tokens per compartment, controls whether model *inputs* are
     # also permuted. If False, inputs use the unpermuted base tokens while
     # targets remain in the permuted id space.
-    permute_input_tokens_per_compartment: bool = True
+    permute_input_tokens_per_compartment: FlagConversionOff[bool] = True
 
 
 @dataclass(frozen=True)
