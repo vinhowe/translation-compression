@@ -4,7 +4,10 @@ from typing import Literal
 
 
 def compute_weights_map(
-    n: int, t: float, scaling: Literal["equal", "unequal"]
+    n: int,
+    t: float,
+    scaling: Literal["equal", "unequal"],
+    mode: Literal["compartment", "absolute"] = "compartment",
 ) -> dict[str, float]:
     """Compute sampling weights for compartments and translations.
 
@@ -16,6 +19,10 @@ def compute_weights_map(
         Translation ratio. Must be >= 0. When t = 0, no translation weights are created.
     scaling: Literal["equal", "unequal"]
         Base compartment weighting scheme.
+    mode: Literal["compartment", "absolute"]
+        How to interpret t:
+        - "compartment": t=1 means translation data equals one compartment's worth
+        - "absolute": t is the fraction of overall data that is translation (t=1 means all translation)
 
     Returns
     -------
@@ -28,6 +35,8 @@ def compute_weights_map(
         raise ValueError("n must be >= 1")
     if t < 0:
         raise ValueError("translation ratio t must be >= 0")
+    if mode == "absolute" and t > 1:
+        raise ValueError("absolute mode requires t <= 1")
     if t > 0 and n < 2:
         raise ValueError("translation_ratio > 0 requires n >= 2")
 
@@ -40,8 +49,14 @@ def compute_weights_map(
         base_weights = [float(i + 1) / z for i in range(n)]
 
     # Mass split between compartments and translations
-    mc = float(n) / float(n + t)
-    mt = float(t) / float(n + t)
+    if mode == "compartment":
+        # t=1 means translation data equals one compartment's worth
+        mc = float(n) / float(n + t)
+        mt = float(t) / float(n + t)
+    else:  # mode == "absolute"
+        # t is the fraction of overall data that is translation
+        mt = t
+        mc = 1.0 - t
 
     weights: dict[str, float] = {}
 

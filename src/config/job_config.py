@@ -146,6 +146,10 @@ class Experiment:
     # Scaling factor for translation tokens; 0 = no translations, 1 = as much
     # translation data as any one domain
     translation_ratio: float = 0
+    # How to interpret translation_ratio:
+    # - "compartment": 1 = as much translation data as any one compartment (default)
+    # - "absolute": ratio of overall data that is translation; 1 = all translation data
+    translation_ratio_mode: Literal["compartment", "absolute"] = "compartment"
     # Shuffle seed for deterministic ordering
     assignment_seed: int = 0
     # Maximum number of compartments. REQUIRED: must be provided in config.
