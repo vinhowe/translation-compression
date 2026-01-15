@@ -449,6 +449,12 @@ def main(config: JobConfig) -> None:
         config,
         experiment=replace(config.experiment, assignment_seed=config.training.seed),
     )
+    # If uniform_seed is 0 (default), inherit from training.seed for simpler sweep configs
+    if config.data.uniform_seed == 0:
+        config = replace(
+            config,
+            data=replace(config.data, uniform_seed=config.training.seed),
+        )
     # -----------------------------------------------------------------------------
     # Unpack config into local variables (matches original script expectations)
     # wandb logging
