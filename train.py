@@ -37,7 +37,7 @@ from src.config.job_config import JobConfig, Model
 from src.config.manager import ConfigManager
 from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, write_meta
 from src.model import GPT
-from src.data import UniformBatchDataLoader
+from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
 from src.config.presets import apply_size_tier
 from src.weights import compute_weights_map
@@ -916,17 +916,53 @@ def main(config: JobConfig) -> None:
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
             )
     else:
-        # Uniform synthetic stream for quick debugging
-        train_loader = UniformBatchDataLoader(
-            B=batch_size,
-            T=block_size,
-            vocab_size=composite_vocab,
-            seed=config.data.uniform_seed + training_seed,
-            process_rank=ddp_rank or 0,
-            num_processes=ddp_world_size,
-            return_compartment_ids=bool(exp_cfg.use_compartment_embeddings),
-            pin_memory=True,
+        # Uniform synthetic stream
+        # Check if we need compartment/translation support
+        needs_compartments = (
+            exp_cfg.n_compartments > 1 or exp_cfg.translation_ratio > 0
         )
+        if needs_compartments:
+            # Generate permutations in-memory if needed
+            uniform_perms = None
+            if exp_cfg.permute_tokens_per_compartment:
+                max_c = cast(int, exp_cfg.max_compartments)
+                ss = np.random.SeedSequence(int(training_seed) & 0xFFFFFFFFFFFFFFFF)
+                child_seeds = ss.spawn(max_c)
+                uniform_perms = np.empty((max_c, base_vocab), dtype=np.int64)
+                for c, child_ss in enumerate(child_seeds):
+                    gen = np.random.Generator(np.random.PCG64(child_ss))
+                    uniform_perms[c] = gen.permutation(base_vocab).astype(np.int64)
+                print0(f"Generated in-memory permutations with shape {uniform_perms.shape}")
+
+            train_loader = UniformCompartmentDataLoader(
+                B=batch_size,
+                T=block_size,
+                base_vocab_size=base_vocab,
+                seed=config.data.uniform_seed + training_seed,
+                n_compartments=exp_cfg.n_compartments,
+                max_compartments=cast(int, exp_cfg.max_compartments),
+                translation_ratio=exp_cfg.translation_ratio,
+                translation_ratio_mode=exp_cfg.translation_ratio_mode,
+                compartment_scaling=exp_cfg.compartment_scaling,
+                process_rank=ddp_rank or 0,
+                num_processes=ddp_world_size,
+                permute_tokens=exp_cfg.permute_tokens_per_compartment,
+                permutations=uniform_perms,
+                permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
+                pin_memory=True,
+            )
+        else:
+            # Simple single-compartment uniform data (original behavior)
+            train_loader = UniformBatchDataLoader(
+                B=batch_size,
+                T=block_size,
+                vocab_size=composite_vocab,
+                seed=config.data.uniform_seed + training_seed,
+                process_rank=ddp_rank or 0,
+                num_processes=ddp_world_size,
+                return_compartment_ids=bool(exp_cfg.use_compartment_embeddings),
+                pin_memory=True,
+            )
         val_loader = None
 
     # helps estimate an arbitrarily accurate loss over either split using many batches
