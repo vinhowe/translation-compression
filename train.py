@@ -648,6 +648,7 @@ def main(config: JobConfig) -> None:
                                     n=exp.n_compartments,
                                     t=max(0.0, float(exp.translation_ratio)),
                                     scaling=exp.compartment_scaling,
+                                    mode=exp.translation_ratio_mode,
                                 ),
                                 total_examples=total_examples,
                                 max_compartments=max_compartments_int,
