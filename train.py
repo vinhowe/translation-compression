@@ -43,6 +43,11 @@ from src.config.presets import apply_size_tier
 from src.weights import compute_weights_map
 import struct
 
+# Limit CPU threads to avoid oversubscription when running multiple processes
+# Default to 4 threads; override with OMP_NUM_THREADS env var
+_num_threads = int(os.environ.get("OMP_NUM_THREADS", "4"))
+torch.set_num_threads(_num_threads)
+
 
 def print0(*args, **kwargs):
     # modified print that only prints from the master process
