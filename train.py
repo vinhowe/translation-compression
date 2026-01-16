@@ -46,7 +46,9 @@ import threading
 from queue import Queue
 
 
-def check_duplicate_run(config: JobConfig, wandb_project: str) -> Optional[str]:
+def check_duplicate_run(
+    config: JobConfig, wandb_project: str, wandb_group: Optional[str] = None
+) -> Optional[str]:
     """Check if a completed run with the same config already exists in wandb.
 
     Returns the run ID if a duplicate is found, None otherwise.
@@ -77,10 +79,15 @@ def check_duplicate_run(config: JobConfig, wandb_project: str) -> Optional[str]:
             "optimizer": config_dict["optimizer"],
         }
 
+        # Build filters - only query finished runs, optionally within a group
+        filters = {"state": "finished"}
+        if wandb_group:
+            filters["group"] = wandb_group
+
         # Query completed runs in the project
         runs = api.runs(
             wandb_project,
-            filters={"state": "finished"},
+            filters=filters,
             per_page=1000,
         )
 
@@ -556,7 +563,7 @@ def main(config: JobConfig) -> None:
 
     # Check for duplicate completed runs before expensive setup
     if wandb_log:
-        dup_run_id = check_duplicate_run(config, wandb_project)
+        dup_run_id = check_duplicate_run(config, wandb_project, wandb_group)
         if dup_run_id:
             print0(
                 f"[dedupe] Skipping: found completed run with same config: {dup_run_id}"
