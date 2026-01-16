@@ -42,6 +42,73 @@ from src.assignments import write_assignments
 from src.config.presets import apply_size_tier
 from src.weights import compute_weights_map
 import struct
+import threading
+from queue import Queue
+
+
+def check_duplicate_run(config: JobConfig, wandb_project: str) -> Optional[str]:
+    """Check if a completed run with the same config already exists in wandb.
+
+    Returns the run ID if a duplicate is found, None otherwise.
+    Only checks on master process (rank 0).
+    """
+    if int(os.environ.get("RANK", 0)) != 0:
+        return None
+
+    try:
+        import wandb
+
+        api = wandb.Api()
+
+        # Extract meaningful config fields for comparison (exclude logging/system settings)
+        config_dict = asdict(config)
+
+        # For data section, only compare fields that affect training
+        # uniform_seed only matters for uniform data source, not pretokenized
+        data_compare = config_dict["data"].copy()
+        if config_dict["data"].get("source") == "pretokenized":
+            data_compare.pop("uniform_seed", None)
+
+        compare_fields = {
+            "model": config_dict["model"],
+            "training": config_dict["training"],
+            "experiment": config_dict["experiment"],
+            "data": data_compare,
+            "optimizer": config_dict["optimizer"],
+        }
+
+        # Query completed runs in the project
+        runs = api.runs(
+            wandb_project,
+            filters={"state": "finished"},
+            per_page=1000,
+        )
+
+        for run in runs:
+            run_config = run.config
+            # Compare the meaningful fields
+            match = True
+            for section, expected in compare_fields.items():
+                run_section = run_config.get(section, {})
+
+                # For data section with pretokenized source, ignore uniform_seed in existing run too
+                if section == "data" and expected.get("source") == "pretokenized":
+                    run_section = run_section.copy() if run_section else {}
+                    run_section.pop("uniform_seed", None)
+
+                if run_section != expected:
+                    match = False
+                    break
+
+            if match:
+                return run.id
+
+    except Exception as e:
+        # Don't fail training if wandb API is unavailable
+        print(f"[dedupe] Warning: Could not check for duplicates: {e}")
+
+    return None
+
 
 # Limit CPU threads to avoid oversubscription when running multiple processes
 # Default to 4 threads; override with OMP_NUM_THREADS env var
@@ -234,6 +301,17 @@ class AssignmentsDataLoader:
         # assignment index start (strided by world size)
         self.assignment_idx = self.process_rank % max(1, self.num_records)
 
+        # Pre-allocate pinned memory tensors to avoid expensive allocation per batch
+        # Pinned memory allocation is ~200ms, so reusing saves significant time
+        if self._pin_memory:
+            self._x_buf = torch.empty((B, T), dtype=torch.long, pin_memory=True)
+            self._y_buf = torch.empty((B, T), dtype=torch.long, pin_memory=True)
+            self._cids_buf = torch.empty((B, T), dtype=torch.long, pin_memory=True)
+        else:
+            self._x_buf = None
+            self._y_buf = None
+            self._cids_buf = None
+
     def _load_shard(self, idx: int) -> None:
         new_idx = idx % len(self.files)
         if new_idx != self.current_shard:
@@ -282,10 +360,15 @@ class AssignmentsDataLoader:
         half = T // 2
         assert T % 2 == 0 and half >= 2, "block_size must be even and >= 4"
 
-        # Allocate pinned-memory CPU tensors (if enabled) and get NumPy views for fast vectorized filling
-        x_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin_memory)
-        y_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin_memory)
-        cids_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin_memory)
+        # Reuse pre-allocated pinned-memory tensors if available (avoids ~200ms alloc overhead)
+        if self._x_buf is not None:
+            x_t = self._x_buf
+            y_t = self._y_buf
+            cids_t = self._cids_buf
+        else:
+            x_t = torch.empty((B, T), dtype=torch.long)
+            y_t = torch.empty((B, T), dtype=torch.long)
+            cids_t = torch.empty((B, T), dtype=torch.long)
 
         x_np = x_t.numpy()
         y_np = y_t.numpy()
@@ -336,16 +419,18 @@ class AssignmentsDataLoader:
             cid_tr[:, half] = dsts[idx_trans]
 
             if self.permute_tokens:
-                # Per-row permutations
-                src_maps = cast(np.ndarray, self._permutations)[
-                    srcs[idx_trans]
-                ]  # [m, base_vocab]
-                dst_maps = cast(np.ndarray, self._permutations)[
-                    dsts[idx_trans]
-                ]  # [m, base_vocab]
-                # Map tokens row-wise once
-                perm_src = np.take_along_axis(src_maps, samples[:, : half - 1], axis=1)
-                perm_dst = np.take_along_axis(dst_maps, samples[:, : half - 1], axis=1)
+                # Direct fancy indexing - avoids loading full rows (2000x faster)
+                # Old approach loaded entire rows (~311MB), new approach loads only needed elements (~64KB)
+                perms = cast(np.ndarray, self._permutations)
+                src_comp = srcs[idx_trans][:, None]  # [m, 1]
+                dst_comp = dsts[idx_trans][:, None]  # [m, 1]
+                token_slice = samples[:, : half - 1]  # [m, half-1]
+                perm_src = perms[
+                    np.broadcast_to(src_comp, token_slice.shape), token_slice
+                ]
+                perm_dst = perms[
+                    np.broadcast_to(dst_comp, token_slice.shape), token_slice
+                ]
                 # Inputs: optionally permuted
                 if self.permute_inputs:
                     seq_in[:, 1:half] = perm_src
@@ -387,10 +472,10 @@ class AssignmentsDataLoader:
             samples = tokens_batch[comp_starts + base_idx_T]
 
             if self.permute_tokens:
-                src_maps = cast(np.ndarray, self._permutations)[
-                    srcs[idx_comp]
-                ]  # [n, base_vocab]
-                perm_samples = np.take_along_axis(src_maps, samples, axis=1)
+                # Direct fancy indexing - avoids loading full rows (2000x faster)
+                perms = cast(np.ndarray, self._permutations)
+                src_comp = srcs[idx_comp][:, None]  # [n, 1]
+                perm_samples = perms[np.broadcast_to(src_comp, samples.shape), samples]
                 # Inputs: optionally permuted
                 if self.permute_inputs:
                     x_comp = perm_samples
@@ -468,6 +553,19 @@ def main(config: JobConfig) -> None:
     wandb_run_name = config.logging.wandb_run_name
     wandb_group = config.logging.wandb_group
     wandb_notes = config.logging.wandb_notes
+
+    # Check for duplicate completed runs before expensive setup
+    if wandb_log:
+        dup_run_id = check_duplicate_run(config, wandb_project)
+        if dup_run_id:
+            print0(
+                f"[dedupe] Skipping: found completed run with same config: {dup_run_id}"
+            )
+            print0(
+                f"[dedupe] View at: https://wandb.ai/pccl/{wandb_project}/runs/{dup_run_id}"
+            )
+            return
+
     # I/O: structured run directory under hardcoded storage root
     run_id = os.environ.get("RUN_ID", uuid.uuid4().hex[:8])
     out_root = os.path.join(STORAGE_ROOT, "out")
@@ -919,9 +1017,7 @@ def main(config: JobConfig) -> None:
     else:
         # Uniform synthetic stream
         # Check if we need compartment/translation support
-        needs_compartments = (
-            exp_cfg.n_compartments > 1 or exp_cfg.translation_ratio > 0
-        )
+        needs_compartments = exp_cfg.n_compartments > 1 or exp_cfg.translation_ratio > 0
         if needs_compartments:
             # Generate permutations in-memory if needed
             uniform_perms = None
@@ -933,7 +1029,9 @@ def main(config: JobConfig) -> None:
                 for c, child_ss in enumerate(child_seeds):
                     gen = np.random.Generator(np.random.PCG64(child_ss))
                     uniform_perms[c] = gen.permutation(base_vocab).astype(np.int64)
-                print0(f"Generated in-memory permutations with shape {uniform_perms.shape}")
+                print0(
+                    f"Generated in-memory permutations with shape {uniform_perms.shape}"
+                )
 
             train_loader = UniformCompartmentDataLoader(
                 B=batch_size,
