@@ -95,6 +95,8 @@ class UniformCompartmentDataLoader:
 
     def __post_init__(self) -> None:
         self._pin = bool(self.pin_memory and torch.cuda.is_available())
+        B, T = self.B, self.T
+        half = T // 2
 
         # Compute weights for compartments and translations
         from src.weights import compute_weights_map
@@ -106,18 +108,30 @@ class UniformCompartmentDataLoader:
             mode=self.translation_ratio_mode,
         )
 
-        # Build category list and probability array for sampling
-        self._categories: list[tuple[str, int, int]] = []  # (kind, src, dst)
+        # Build category arrays for vectorized sampling (avoid string comparisons)
+        # kind: 0 = compartment, 1 = translation
+        cat_kinds: list[int] = []
+        cat_srcs: list[int] = []
+        cat_dsts: list[int] = []
         probs: list[float] = []
         for key, prob in sorted(self._weights_map.items()):
             if ">" in key:
                 left, right = key.split(">", 1)
-                self._categories.append(("T", int(left), int(right)))
+                cat_kinds.append(1)  # translation
+                cat_srcs.append(int(left))
+                cat_dsts.append(int(right))
             else:
-                self._categories.append(("C", int(key), 0))
+                cat_kinds.append(0)  # compartment
+                cat_srcs.append(int(key))
+                cat_dsts.append(0)
             probs.append(prob)
+
+        self._cat_kinds = np.array(cat_kinds, dtype=np.int64)
+        self._cat_srcs = np.array(cat_srcs, dtype=np.int64)
+        self._cat_dsts = np.array(cat_dsts, dtype=np.int64)
         self._probs = np.array(probs, dtype=np.float64)
         self._probs /= self._probs.sum()  # normalize
+        self._num_categories = len(cat_kinds)
 
         # Translation token id
         self.translation_token_id = (
@@ -127,16 +141,42 @@ class UniformCompartmentDataLoader:
         )
 
         # Initialize RNGs with different seeds for categories vs tokens
-        # This ensures category sampling and token generation are independent streams
         self._cat_rng = np.random.Generator(
             np.random.PCG64(int(self.seed) + int(self.process_rank))
         )
         self._tok_gen = torch.Generator()
-        # Use a different offset for token generation to ensure independence
         self._tok_gen.manual_seed(int(self.seed) + int(self.process_rank) + 1_000_000)
 
-        # Store permutations if provided
-        self._permutations = self.permutations
+        # Store permutations as torch tensor for faster indexing
+        if self.permutations is not None:
+            self._perm_torch = torch.from_numpy(self.permutations).long()
+            if self._pin:
+                self._perm_torch = self._perm_torch.pin_memory()
+        else:
+            self._perm_torch = None
+
+        # Pre-allocate output buffers (reused every batch)
+        self._x = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
+        self._y = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
+        self._cids = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
+
+        # Pre-allocate work buffers for translation rows (worst case: all translation)
+        self._seq_in = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
+        self._seq_out = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
+
+        # Pre-compute index tensors that don't change
+        self._half = half
+        self._arange_half = torch.arange(half, dtype=torch.long)
+        self._arange_T = torch.arange(T, dtype=torch.long)
+        self._arange_B = torch.arange(B, dtype=torch.long)
+
+        # Pre-allocate token buffer (worst case: B * T tokens)
+        self._all_tokens = torch.empty(B * T, dtype=torch.long)
+
+        # Pre-allocate numpy buffers for vectorized operations
+        self._kinds = np.empty(B, dtype=np.int64)
+        self._srcs_np = np.empty(B, dtype=np.int64)
+        self._dsts_np = np.empty(B, dtype=np.int64)
 
     def reset(self) -> None:
         """Re-seed RNGs to initial state for deterministic resets."""
@@ -146,138 +186,159 @@ class UniformCompartmentDataLoader:
         self._tok_gen.manual_seed(int(self.seed) + int(self.process_rank) + 1_000_000)
 
     def next_batch(self):
-        B = self.B
-        T = self.T
-        half = T // 2
-        assert T % 2 == 0 and half >= 2, "block_size must be even and >= 4"
-
-        # Allocate output tensors
-        x_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
-        y_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
-        cids_t = torch.empty((B, T), dtype=torch.long, pin_memory=self._pin)
-
-        x_np = x_t.numpy()
-        y_np = y_t.numpy()
-        cid_np = cids_t.numpy()
+        B, T, half = self.B, self.T, self._half
 
         # Sample categories for each batch item
-        cat_indices = self._cat_rng.choice(len(self._categories), size=B, p=self._probs)
+        cat_indices = self._cat_rng.choice(self._num_categories, size=B, p=self._probs)
 
-        # Decode categories
-        kinds = np.array([self._categories[i][0] for i in cat_indices])
-        srcs = np.array([self._categories[i][1] for i in cat_indices], dtype=np.int64)
-        dsts = np.array([self._categories[i][2] for i in cat_indices], dtype=np.int64)
+        # Vectorized category decode using pre-allocated buffers
+        np.take(self._cat_kinds, cat_indices, out=self._kinds)
+        np.take(self._cat_srcs, cat_indices, out=self._srcs_np)
+        np.take(self._cat_dsts, cat_indices, out=self._dsts_np)
 
-        is_trans = kinds == "T"
-        idx_trans = np.nonzero(is_trans)[0]
-        idx_comp = np.nonzero(~is_trans)[0]
+        is_trans = self._kinds == 1
+        n_trans = is_trans.sum()
+        n_comp = B - n_trans
 
-        # Generate random base tokens for all items
-        # Translation items need half tokens, compartment items need T tokens
-        size_per_b = np.where(is_trans, half, T).astype(np.int64)
-        total_needed = int(size_per_b.sum())
+        # Convert to torch (views, no copy)
+        srcs_t = torch.from_numpy(self._srcs_np)
+        dsts_t = torch.from_numpy(self._dsts_np)
 
-        tokens_flat = torch.randint(
-            0,
-            self.base_vocab_size,
-            (total_needed,),
-            generator=self._tok_gen,
-            dtype=torch.long,
-        ).numpy()
+        # Generate random tokens into pre-allocated buffer
+        torch.randint(
+            0, self.base_vocab_size, (B * T,),
+            generator=self._tok_gen, dtype=torch.long,
+            out=self._all_tokens
+        )
+        all_tokens = self._all_tokens
 
-        # Compute start indices for each batch item's tokens
-        starts = np.zeros(B, dtype=np.int64)
-        if B > 1:
-            starts[1:] = np.cumsum(size_per_b[:-1], dtype=np.int64)
+        # Get references to pre-allocated buffers
+        x = self._x
+        y = self._y
+        cids = self._cids
 
-        # Process translation examples
-        if idx_trans.size > 0:
-            m = int(idx_trans.size)
-            base_idx_half = np.arange(half, dtype=np.int64)[None, :]
-            trans_starts = starts[idx_trans][:, None]
-            samples = tokens_flat[trans_starts + base_idx_half]
+        if n_trans > 0 and n_comp > 0:
+            # Mixed batch - process both types
+            idx_trans = torch.from_numpy(np.nonzero(is_trans)[0])
+            idx_comp = torch.from_numpy(np.nonzero(~is_trans)[0])
 
-            # Prepare input/output seq and cids for translation rows
-            seq_in = np.empty((m, T), dtype=np.int64)
-            seq_out = np.empty((m, T), dtype=np.int64)
-            cid_tr = np.empty((m, T), dtype=np.int64)
+            # Process translation rows
+            self._fill_translation_rows(
+                x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, n_trans
+            )
 
-            # Set translation token positions
-            seq_in[:, 0] = self.translation_token_id
-            seq_in[:, half] = self.translation_token_id
-            seq_out[:, 0] = self.translation_token_id
-            seq_out[:, half] = self.translation_token_id
-            cid_tr[:, 0] = srcs[idx_trans]
-            cid_tr[:, half] = dsts[idx_trans]
+            # Process compartment rows
+            self._fill_compartment_rows(
+                x, y, cids, idx_comp, srcs_t, all_tokens, n_trans, n_comp
+            )
 
-            if self.permute_tokens and self._permutations is not None:
-                # Per-row permutations
-                src_maps = self._permutations[srcs[idx_trans]]
-                dst_maps = self._permutations[dsts[idx_trans]]
-                # Map tokens row-wise
-                perm_src = np.take_along_axis(src_maps, samples[:, : half - 1], axis=1)
-                perm_dst = np.take_along_axis(dst_maps, samples[:, : half - 1], axis=1)
-                # Inputs: optionally permuted
-                if self.permute_inputs:
-                    seq_in[:, 1:half] = perm_src
-                    seq_in[:, half + 1 :] = perm_dst
-                else:
-                    seq_in[:, 1:half] = samples[:, : half - 1]
-                    seq_in[:, half + 1 :] = samples[:, : half - 1]
-                # Targets: always in permuted space
-                seq_out[:, 1:half] = perm_src
-                seq_out[:, half + 1 :] = perm_dst
+        elif n_trans > 0:
+            # All translation
+            idx_trans = self._arange_B
+            self._fill_translation_rows(
+                x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, n_trans
+            )
+
+        else:
+            # All compartment
+            idx_comp = self._arange_B
+            self._fill_compartment_rows(
+                x, y, cids, idx_comp, srcs_t, all_tokens, 0, n_comp
+            )
+
+        return x, y, cids
+
+    def _fill_translation_rows(
+        self, x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, m
+    ):
+        """Fill translation rows into output tensors."""
+        half, T = self._half, self.T
+        trans_token = self.translation_token_id
+
+        # Get source/dest compartments for translation rows
+        src_c = srcs_t[idx_trans]
+        dst_c = dsts_t[idx_trans]
+
+        # Extract tokens for translation rows (half tokens each, starting at offset 0)
+        # tokens shape: (m, half)
+        tokens = all_tokens[: m * half].view(m, half)
+        content = tokens[:, : half - 1]  # actual content (excluding last position)
+
+        # Apply permutations if needed
+        if self.permute_tokens and self._perm_torch is not None:
+            # Gather permutation maps for each row's src/dst compartment
+            perm_src = self._perm_torch[src_c]  # (m, vocab)
+            perm_dst = self._perm_torch[dst_c]  # (m, vocab)
+            # Apply permutation: perm[content] using gather
+            content_src = torch.gather(perm_src, 1, content)
+            content_dst = torch.gather(perm_dst, 1, content)
+        else:
+            # Offset-based (no permutation)
+            base = self.base_vocab_size
+            content_src = content + (src_c * base).unsqueeze(1)
+            content_dst = content + (dst_c * base).unsqueeze(1)
+
+        # Build x for translation rows
+        # Layout: [TRANS, src_content..., TRANS, dst_content...]
+        x_trans = x[idx_trans]
+        x_trans[:, 0] = trans_token
+        x_trans[:, half] = trans_token
+        if self.permute_inputs:
+            x_trans[:, 1:half] = content_src
+            x_trans[:, half + 1:] = content_dst
+        else:
+            x_trans[:, 1:half] = content
+            x_trans[:, half + 1:] = content
+
+        # Build y (next token prediction targets)
+        # y[t] = x[t+1] for autoregressive, with permuted targets
+        y_trans = y[idx_trans]
+        y_trans[:, 0] = content_src[:, 0]  # after first TRANS
+        y_trans[:, 1:half - 1] = content_src[:, 1:]
+        y_trans[:, half - 1] = trans_token  # predict second TRANS
+        y_trans[:, half] = content_dst[:, 0]  # after second TRANS
+        y_trans[:, half + 1:-1] = content_dst[:, 1:]
+        y_trans[:, -1] = -1  # ignore last position
+
+        # Build cids
+        cids_trans = cids[idx_trans]
+        cids_trans[:, :half] = src_c.unsqueeze(1)
+        cids_trans[:, half:] = dst_c.unsqueeze(1)
+
+    def _fill_compartment_rows(
+        self, x, y, cids, idx_comp, srcs_t, all_tokens, token_offset, m
+    ):
+        """Fill compartment rows into output tensors."""
+        T = self.T
+        half = self._half
+
+        # Get source compartments for compartment rows
+        src_c = srcs_t[idx_comp]
+
+        # Extract tokens for compartment rows
+        # Start after translation tokens (token_offset = n_trans * half)
+        start = token_offset * half
+        tokens = all_tokens[start: start + m * T].view(m, T)
+
+        # Apply permutations if needed
+        if self.permute_tokens and self._perm_torch is not None:
+            perm_src = self._perm_torch[src_c]  # (m, vocab)
+            perm_tokens = torch.gather(perm_src, 1, tokens)
+            if self.permute_inputs:
+                x_comp = perm_tokens
             else:
-                base = self.base_vocab_size
-                src_offsets = srcs[idx_trans] * base
-                dst_offsets = dsts[idx_trans] * base
-                seq_in[:, 1:half] = samples[:, : half - 1] + src_offsets[:, None]
-                seq_in[:, half + 1 :] = samples[:, : half - 1] + dst_offsets[:, None]
-                seq_out[:, 1:half] = seq_in[:, 1:half]
-                seq_out[:, half + 1 :] = seq_in[:, half + 1 :]
+                x_comp = tokens
+            # Targets always in permuted space
+            y_comp = torch.empty_like(perm_tokens)
+            y_comp[:, :-1] = perm_tokens[:, 1:]
+            y_comp[:, -1] = -1
+        else:
+            base = self.base_vocab_size
+            x_comp = tokens + (src_c * base).unsqueeze(1)
+            y_comp = torch.empty_like(x_comp)
+            y_comp[:, :-1] = x_comp[:, 1:]
+            y_comp[:, -1] = -1
 
-            # Fill cids across spans
-            cid_tr[:, 1:half] = srcs[idx_trans][:, None]
-            cid_tr[:, half + 1 :] = dsts[idx_trans][:, None]
-
-            # Targets: next-token; last is ignored
-            y_tr = np.empty_like(seq_out)
-            y_tr[:, :-1] = seq_out[:, 1:]
-            y_tr[:, -1] = -1
-
-            # Scatter into batch slots
-            x_np[idx_trans] = seq_in
-            y_np[idx_trans] = y_tr
-            cid_np[idx_trans] = cid_tr
-
-        # Process compartment examples
-        if idx_comp.size > 0:
-            base_idx_T = np.arange(T, dtype=np.int64)[None, :]
-            comp_starts = starts[idx_comp][:, None]
-            samples = tokens_flat[comp_starts + base_idx_T]
-
-            if self.permute_tokens and self._permutations is not None:
-                src_maps = self._permutations[srcs[idx_comp]]
-                perm_samples = np.take_along_axis(src_maps, samples, axis=1)
-                # Inputs: optionally permuted
-                if self.permute_inputs:
-                    x_comp = perm_samples
-                else:
-                    x_comp = samples
-                # Targets: always in permuted space
-                y_comp = np.empty_like(perm_samples)
-                y_comp[:, :-1] = perm_samples[:, 1:]
-                y_comp[:, -1] = -1
-            else:
-                base = self.base_vocab_size
-                src_offsets = srcs[idx_comp] * base
-                x_comp = samples + src_offsets[:, None]
-                y_comp = np.empty_like(x_comp)
-                y_comp[:, :-1] = x_comp[:, 1:]
-                y_comp[:, -1] = -1
-
-            x_np[idx_comp] = x_comp
-            y_np[idx_comp] = y_comp
-            cid_np[idx_comp, :] = srcs[idx_comp][:, None]
-
-        return x_t, y_t, cids_t
+        x[idx_comp] = x_comp
+        y[idx_comp] = y_comp
+        cids[idx_comp] = src_c.unsqueeze(1).expand(-1, T)
