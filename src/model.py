@@ -17,6 +17,13 @@ from torch.nn import functional as F
 
 from src.config.job_config import Model
 
+# Try to use flash-attn package (faster on H100)
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
 
 class LayerNorm(nn.Module):
     """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
@@ -50,30 +57,28 @@ class CausalSelfAttention(nn.Module):
             x.size()
         )  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # calculate query, key, values for all heads in batch
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=self.dropout if self.training else 0,
-            is_causal=True,
-        )
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
+        if FLASH_ATTN_AVAILABLE:
+            # flash_attn expects (B, T, nh, hs) format
+            q = q.view(B, T, self.n_head, C // self.n_head)
+            k = k.view(B, T, self.n_head, C // self.n_head)
+            v = v.view(B, T, self.n_head, C // self.n_head)
+            y = flash_attn_func(q, k, v, causal=True,
+                               dropout_p=self.dropout if self.training else 0.0)
+            y = y.view(B, T, C)
+        else:
+            # PyTorch SDPA expects (B, nh, T, hs) format
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True,
+            )
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
