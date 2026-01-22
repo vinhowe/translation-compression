@@ -39,7 +39,7 @@ from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, write_m
 from src.model import GPT
 from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
-from src.config.presets import apply_size_tier
+from src.config.presets import apply_size_tier, apply_bpe16384_batch_config
 from src.weights import compute_weights_map
 import struct
 import threading
@@ -542,6 +542,8 @@ STORAGE_ROOT = "/nobackup/archive/grp/grp_pccl/vin/dev/translation-compression"
 def main(config: JobConfig) -> None:
     # Apply size tier overrides (if provided) and mirror assignment_seed to training.seed
     config = apply_size_tier(config)
+    # Auto-configure batch/grad_accum for bpe16384 vocab if not explicitly set
+    config = apply_bpe16384_batch_config(config)
     config = replace(
         config,
         experiment=replace(config.experiment, assignment_seed=config.training.seed),
