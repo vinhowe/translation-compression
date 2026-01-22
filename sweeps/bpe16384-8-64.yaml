@@ -1,0 +1,20 @@
+method: grid
+name: bpe16384-8-64-seed-64
+project: translation-compression
+program: train.py
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --job.config-file
+  - ./config/sweep-base-bpe16384.toml
+  - ${args}
+parameters:
+  model.size_tier:
+    values: ["8-64"]
+  training.seed:
+    values: [64]
+  experiment.n_compartments:
+    values: [2, 4, 8, 16]
+  experiment.translation_ratio:
+    values: [0.1, 0.25, 0.5, 0.75, 1.0]
