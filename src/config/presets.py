@@ -11,6 +11,64 @@ TIER_SPECS: dict[str, dict[str, int]] = {
     "8-256": {"n_layer": 8, "n_embd": 256, "batch_size": 512, "grad_accum": 4},
 }
 
+# Batch/grad_accum presets for vocab_size=16384 with no permutation (compartment embedding mode).
+# Tested on 80GB GPUs. Key is (n_embd, max_compartments) -> (batch_size, grad_accum).
+# Effective batch size is always 2048.
+BPE16384_BATCH_SPECS: dict[tuple[int, int], tuple[int, int]] = {
+    # 8-32, 8-64, 8-128 all have the same requirements
+    (32, 2): (2048, 1),
+    (32, 4): (1024, 2),
+    (32, 8): (512, 4),
+    (32, 16): (256, 8),
+    (64, 2): (2048, 1),
+    (64, 4): (1024, 2),
+    (64, 8): (512, 4),
+    (64, 16): (256, 8),
+    (128, 2): (2048, 1),
+    (128, 4): (1024, 2),
+    (128, 8): (512, 4),
+    (128, 16): (256, 8),
+    # 8-256 needs more accumulation
+    (256, 2): (1024, 2),
+    (256, 4): (512, 4),
+    (256, 8): (256, 8),
+    (256, 16): (128, 16),
+}
+
+
+def apply_bpe16384_batch_config(cfg: JobConfig) -> JobConfig:
+    """Auto-configure batch_size and gradient_accumulation_steps for vocab_size=16384.
+
+    Only applies when:
+    - vocab_size == 16384 (base vocab for bpe16384 tokenizer)
+    - permute_tokens_per_compartment is False (compartment embedding mode)
+    - n_embd and max_compartments match a known configuration
+
+    Effective batch size is always 2048.
+    """
+    # Check preconditions
+    if cfg.model.vocab_size != 16384:
+        return cfg
+    if cfg.experiment.permute_tokens_per_compartment:
+        return cfg
+
+    n_embd = cfg.model.n_embd
+    max_comp = cfg.experiment.max_compartments
+    if n_embd is None or max_comp is None:
+        return cfg
+
+    key = (n_embd, max_comp)
+    if key not in BPE16384_BATCH_SPECS:
+        return cfg
+
+    batch_size, grad_accum = BPE16384_BATCH_SPECS[key]
+    new_training = replace(
+        cfg.training,
+        batch_size=batch_size,
+        gradient_accumulation_steps=grad_accum,
+    )
+    return replace(cfg, training=new_training)
+
 
 def apply_size_tier(cfg: JobConfig) -> JobConfig:
     """Apply a predefined size tier to the immutable JobConfig.
