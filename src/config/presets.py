@@ -42,7 +42,7 @@ def apply_bpe16384_batch_config(cfg: JobConfig) -> JobConfig:
     Only applies when:
     - vocab_size == 16384 (base vocab for bpe16384 tokenizer)
     - permute_tokens_per_compartment is False (compartment embedding mode)
-    - n_embd and max_compartments match a known configuration
+    - n_embd and n_compartments match a known configuration
 
     Effective batch size is always 2048.
     """
@@ -53,11 +53,11 @@ def apply_bpe16384_batch_config(cfg: JobConfig) -> JobConfig:
         return cfg
 
     n_embd = cfg.model.n_embd
-    max_comp = cfg.experiment.max_compartments
-    if n_embd is None or max_comp is None:
+    n_comp = cfg.experiment.n_compartments
+    if n_embd is None or n_comp is None:
         return cfg
 
-    key = (n_embd, max_comp)
+    key = (n_embd, n_comp)
     if key not in BPE16384_BATCH_SPECS:
         return cfg
 

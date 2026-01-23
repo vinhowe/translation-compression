@@ -133,11 +133,11 @@ class UniformCompartmentDataLoader:
         self._probs /= self._probs.sum()  # normalize
         self._num_categories = len(cat_kinds)
 
-        # Translation token id
+        # Translation token id - uses n_compartments to match model vocab size
         self.translation_token_id = (
             self.base_vocab_size
             if self.permute_tokens
-            else self.base_vocab_size * self.max_compartments
+            else self.base_vocab_size * self.n_compartments
         )
 
         # Initialize RNGs with different seeds for categories vs tokens

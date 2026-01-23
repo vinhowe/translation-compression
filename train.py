@@ -228,6 +228,7 @@ class AssignmentsDataLoader:
         num_processes: int,
         base_vocab_size: int,
         max_compartments: int,
+        n_compartments: int,
         permute_tokens: bool = False,
         permutations_path: Optional[str] = None,
         permute_inputs: bool = True,
@@ -239,11 +240,12 @@ class AssignmentsDataLoader:
         self.T = T
         self.base_vocab_size = base_vocab_size
         self.max_compartments = max_compartments
+        self.n_compartments = n_compartments
         self.permute_tokens = permute_tokens
         self.permute_inputs = permute_inputs
-        # translation token id differs by mode
+        # translation token id differs by mode; uses n_compartments to match model vocab size
         self.translation_token_id = (
-            base_vocab_size if permute_tokens else base_vocab_size * max_compartments
+            base_vocab_size if permute_tokens else base_vocab_size * n_compartments
         )
         # Optionally load permutations array of shape [max_compartments, base_vocab]
         self._permutations: Optional[np.ndarray]
@@ -886,17 +888,18 @@ def main(config: JobConfig) -> None:
             "model.vocab_size (base) must be set for composite vocab computation"
         )
     # If permuting per compartment, vocabulary is base_vocab + 1 (only translation token)
-    # Otherwise, it's base_vocab * max_compartments + 1 (offset scheme)
+    # Otherwise, it's base_vocab * n_compartments + 1 (offset scheme)
+    # Note: we use n_compartments (not max_compartments) to size the model efficiently
     composite_vocab = (
         base_vocab + 1
         if exp_cfg.permute_tokens_per_compartment
-        else base_vocab * cast(int, exp_cfg.max_compartments) + 1
+        else base_vocab * exp_cfg.n_compartments + 1
     )
     # Translation token id differs by mode
     translation_token_id_cfg = (
         base_vocab
         if exp_cfg.permute_tokens_per_compartment
-        else base_vocab * cast(int, exp_cfg.max_compartments)
+        else base_vocab * exp_cfg.n_compartments
     )
     # Auto-resume from checkpoint if present; else allow gpt2 init; else scratch
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
@@ -949,7 +952,7 @@ def main(config: JobConfig) -> None:
                     else bool(config.experiment.copy_compartment_lm_head)
                 ),
                 "base_vocab_size": base_vocab,
-                "max_compartments": cast(int, exp_cfg.max_compartments),
+                "max_compartments": exp_cfg.n_compartments,  # Use n_compartments for model sizing
                 "translation_token_id": translation_token_id_cfg,
                 # disable weight tying if shared embeddings are used (validated elsewhere)
                 "weight_tying": (
@@ -998,6 +1001,7 @@ def main(config: JobConfig) -> None:
             ddp_world_size,
             base_vocab,
             cast(int, exp_cfg.max_compartments),
+            exp_cfg.n_compartments,
             permute_tokens=exp_cfg.permute_tokens_per_compartment,
             permutations_path=(
                 permutations_path if exp_cfg.permute_tokens_per_compartment else None
@@ -1015,6 +1019,7 @@ def main(config: JobConfig) -> None:
                 ddp_world_size,
                 base_vocab,
                 cast(int, exp_cfg.max_compartments),
+                exp_cfg.n_compartments,
                 permute_tokens=exp_cfg.permute_tokens_per_compartment,
                 permutations_path=(
                     permutations_path
