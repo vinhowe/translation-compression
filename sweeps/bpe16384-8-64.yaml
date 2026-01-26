@@ -15,6 +15,6 @@ parameters:
   training.seed:
     values: [64]
   experiment.n_compartments:
-    values: [2, 4, 8, 16]
+    values: [2, 4, 8]
   experiment.translation_ratio:
     values: [0.1, 0.25, 0.5, 0.75, 1.0]
