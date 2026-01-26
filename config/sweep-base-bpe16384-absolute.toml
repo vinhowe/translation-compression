@@ -1,0 +1,39 @@
+[data]
+train_bin = "data/fineweb350B-dedup-bpe16384/fineweb350b-dedup_train_*.bin"
+val_bin = "data/fineweb350B-dedup-bpe16384/fineweb350b-dedup_val_*.bin"
+
+[model]
+block_size = 64
+vocab_size = 16384
+weight_tying = false
+
+[training]
+max_iters = 1e6
+eval_interval = 10000
+eval_iters = 1
+log_interval = 10
+always_save_checkpoints = true
+
+[optimizer]
+learning_rate = 2e-5
+weight_decay = 0
+
+[system]
+compile = true
+dtype = "bfloat16"
+
+[logging]
+wandb_log = true
+wandb_project = "translation-compression"
+wandb_run_name = "sweep"
+wandb_notes = "bpe16384 compartment embedding sweep (absolute translation ratio)"
+wandb_group = "bpe16384-absolute-sweep"
+
+[experiment]
+n_compartments = 1
+compartment_scaling = "equal"
+translation_ratio = 0
+translation_ratio_mode = "absolute"
+max_compartments = 16
+use_compartment_embeddings = true
+permute_tokens_per_compartment = false
