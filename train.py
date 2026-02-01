@@ -701,7 +701,8 @@ def main(config: JobConfig) -> None:
         # Build description from inputs to assignments creation
         assignments_desc = (
             f"n{exp.n_compartments}_t{_fmt_float(max(0.0, float(exp.translation_ratio)))}_"
-            f"sc{exp.compartment_scaling}_total{total_examples}_"
+            f"m{exp.translation_ratio_mode}_"
+            f"sc{exp.compartment_scaling}_total{int(total_examples)}_"
             f"maxc{max_compartments_int}_seed{int(training_seed)}"
         )
         # Point assignments_path to cached file
