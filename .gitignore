@@ -15,9 +15,9 @@ data/random*
 
 # Training outputs
 out/
-
 tokenizer/
 data/
 supercomputer-out/
 wandb/
 interpretability/
+logs/
