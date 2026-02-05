@@ -14,113 +14,173 @@ example doc to highlight the structure of the dataset:
   "language_score": 0.9185474514961243,
   "token_count": 594
 }
+
+Example of downloading the 100B dataset of FineWeb, from root directory:
+python dev/data/fineweb.py -v 100B
+100B runs for small few hours, depending on your internet and computer.
 """
+
 import os
 import argparse
 import multiprocessing as mp
+
 import numpy as np
 import tiktoken
-# from huggingface_hub import snapshot_download
 from datasets import load_dataset
 from tqdm import tqdm
-import argparse
-import numpy as np
-def write_datafile(filename, toks):
-    """ 
-    Saves token data as a .bin file, for reading in C.
-    - First comes a header with 256 int32s
-    - The tokens follow, each as a uint16
-    """
-    assert len(toks) < 2**31, "token count too large" # ~2.1B tokens
-    # construct the header
-    header = np.zeros(256, dtype=np.int32)
-    header[0] = 20240520 # magic
-    header[1] = 1 # version
-    header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 2 bytes as uint16)
-    # construct the tokens numpy array, if not already
-    if not isinstance(toks, np.ndarray) or not toks.dtype == np.uint16:
-        # validate that no token exceeds a uint16
-        maxtok = 2**16
-        assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
-        toks_np = np.array(toks, dtype=np.uint16)
-    else:
-        toks_np = toks
-    # write to file
-    print(f"writing {len(toks):,} tokens to {filename}")
-    with open(filename, "wb") as f:
-        f.write(header.tobytes())
-        f.write(toks_np.tobytes())
+
+from data_common import write_datafile
+
+import xxhash
 # ------------------------------------------
 
 parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
-parser.add_argument("-v", "--version", type=str, default="10B", help="Which version of fineweb to use 10B|100B")
-parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
+parser.add_argument(
+    "-t", "--type", type=str, default="classic", help="Fineweb type, edu|classic"
+)
+parser.add_argument(
+    "-v",
+    "--version",
+    type=str,
+    default="10B",
+    help="Fineweb data sample size, 10B|100B|350B",
+)
+parser.add_argument(
+    "-s",
+    "--shard_size",
+    type=int,
+    default=10**8,
+    help="Size of each data shard in the output .bin files, in tokens",
+)
+parser.add_argument(
+    "-o",
+    "--output_dir",
+    type=str,
+    default=None,
+    help="Optional output directory for the resulting .bin shards (overrides default cache dir)",
+)
 args = parser.parse_args()
 
 # FineWeb has a few possible subsamples available
-assert args.version in ["10B", "100B"], "version must be one of 10B, 100B"
-if args.version == "10B":
-    local_dir = "fineweb10B"
-    remote_name = "sample-10BT"
-elif args.version == "100B":
-    local_dir = "fineweb100B"
-    remote_name = "sample-100BT"
+assert args.version in {"10B", "100B", "350B"}, (
+    "version must be one of: 10B, 100B, 350B"
+)
+assert args.type in {"edu", "classic"}, "type must be one of: edu, classic"
+directories = {
+    ("classic", "10B"): ("fineweb10B", "sample-10BT"),
+    ("classic", "100B"): ("fineweb100B", "sample-100BT"),
+    ("classic", "350B"): ("fineweb350B", "sample-350BT"),
+    ("edu", "10B"): ("edu_fineweb10B", "sample-10BT"),
+    ("edu", "100B"): ("edu_fineweb100B", "sample-100BT"),
+    ("edu", "350B"): ("edu_fineweb350B", "sample-350BT"),
+}
+local_dir, remote_name = directories[(args.type, args.version)]
 
-# create the cache the local directory if it doesn't exist yet
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+# resolve output directory
+default_cache_dir = os.path.join(os.path.dirname(__file__), local_dir)
+DATA_CACHE_DIR = args.output_dir if args.output_dir is not None else default_cache_dir
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # download the dataset
-fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
+fw = load_dataset(
+    "HuggingFaceFW/fineweb", name=remote_name, split="train", streaming=True
+)
+name = "fineweb"
 
-# init the tokenizer
-enc = tiktoken.get_encoding("gpt2")
-eot = enc._special_tokens['<|endoftext|>'] # end of text token
-def tokenize(doc):
+
+def tokenize_gpt2(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens
-    tokens = [eot] # the special <|endoftext|> token delimits all documents
-    tokens.extend(enc.encode_ordinary(doc["text"]))
-    tokens_np = np.array(tokens)
-    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
-    tokens_np_uint16 = tokens_np.astype(np.uint16)
-    return tokens_np_uint16
+    enc = tiktoken.get_encoding("gpt2")
 
-# tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
-nprocs = max(1, os.cpu_count() - 2) # don't hog the entire system
+    def encode(s):
+        return enc.encode_ordinary(s)
+
+    eot = enc._special_tokens["<|endoftext|>"]  # end of text token
+    tokens = [eot]  # the special <|endoftext|> token delimits all documents
+    tokens.extend(encode(doc["text"]))
+    tokens_np = np.array(tokens)
+    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), (
+        "token dictionary too large for uint16"
+    )
+    tokens_np_uint = tokens_np.astype(np.uint16)
+    return tokens_np_uint
+
+
+CHUNK_SIZE = 32  # tokens per chunk for hashing/dedup and writing
+
+# tokenize all documents and write output shards composed of deduplicated 32-token chunks
+assert args.shard_size % CHUNK_SIZE == 0, (
+    f"shard_size must be a multiple of {CHUNK_SIZE} to align with chunk boundaries"
+)
+
+cpu_total = os.cpu_count() or 1
+nprocs = max(1, cpu_total - 2)  # don't hog the entire system
 with mp.Pool(nprocs) as pool:
     shard_index = 0
-    # preallocate buffer to hold current shard
+    # preallocate buffer to hold current shard (always filled in multiples of CHUNK_SIZE)
     all_tokens_np = np.empty((args.shard_size,), dtype=np.uint16)
     token_count = 0
     progress_bar = None
+
+    # buffer for tokens that don't yet make up a full 32-token chunk across document boundaries
+    pending_np = np.empty((0,), dtype=np.uint16)
+    # store hashes as 16-byte digests (bytes) for memory efficiency
+    seen_hashes = set()
+
+    # main processing loop: tokenize docs in parallel, then chunk/dedupe serially
+    tokenize = tokenize_gpt2
     for tokens in pool.imap(tokenize, fw, chunksize=16):
-
-        # is there enough space in the current shard for the new tokens?
-        if token_count + len(tokens) < args.shard_size:
-            # simply append tokens to current shard
-            all_tokens_np[token_count:token_count+len(tokens)] = tokens
-            token_count += len(tokens)
-            # update progress bar
-            if progress_bar is None:
-                progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
-            progress_bar.update(len(tokens))
+        # combine with pending tokens from previous step to form a continuous stream
+        if pending_np.size:
+            combined = np.concatenate([pending_np, tokens])
         else:
-            # write the current shard and start a new one
-            split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
-            # split the document into whatever fits in this shard; the remainder goes to next one
-            remainder = args.shard_size - token_count
-            progress_bar.update(remainder)
-            all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-            write_datafile(filename, all_tokens_np)
-            shard_index += 1
-            progress_bar = None
-            # populate the next shard with the leftovers of the current doc
-            all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
-            token_count = len(tokens)-remainder
+            combined = tokens
+        # compute how many full 32-token chunks we can form
+        num_full_chunks = combined.size // CHUNK_SIZE
+        if num_full_chunks:
+            chunkable = combined[: num_full_chunks * CHUNK_SIZE]
+            chunks_matrix = chunkable.reshape(-1, CHUNK_SIZE)
+            # iterate over chunks, hash, dedupe, and append only unseen chunks
+            for i in range(chunks_matrix.shape[0]):
+                chunk_row = chunks_matrix[i]
+                # ensure deterministic bytes for hashing: little-endian 16-bit
+                chunk_bytes = chunk_row.astype(np.dtype("<u2"), copy=False).tobytes()
+                digest = xxhash.xxh3_128_digest(chunk_bytes)
+                if digest in seen_hashes:
+                    continue
+                seen_hashes.add(digest)
 
-    # write any remaining tokens as the last shard
+                # if current shard is full, write it and start a new shard
+                if token_count + CHUNK_SIZE > args.shard_size:
+                    split = "val" if shard_index == 0 else "train"
+                    filename = os.path.join(
+                        DATA_CACHE_DIR, f"{name}_{split}_{shard_index:06d}.bin"
+                    )
+                    if progress_bar is not None:
+                        # fill remaining tokens in bar to complete the shard
+                        progress_bar.close()
+                        progress_bar = None
+                    write_datafile(
+                        filename, (all_tokens_np[:token_count]).tolist(), "gpt-2"
+                    )
+                    shard_index += 1
+                    token_count = 0
+
+                # append chunk to current shard
+                if progress_bar is None:
+                    progress_bar = tqdm(
+                        total=args.shard_size,
+                        unit="tokens",
+                        desc=f"Shard {shard_index}",
+                    )
+                all_tokens_np[token_count : token_count + CHUNK_SIZE] = chunk_row
+                token_count += CHUNK_SIZE
+                progress_bar.update(CHUNK_SIZE)
+        # carry over remaining tokens (< CHUNK_SIZE) to next iteration
+        pending_np = combined[num_full_chunks * CHUNK_SIZE :]
+
+    # after all docs are processed, write any remaining shard content (must be multiple of CHUNK_SIZE)
     if token_count != 0:
         split = "val" if shard_index == 0 else "train"
-        filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
-        write_datafile(filename, all_tokens_np[:token_count])
+        filename = os.path.join(DATA_CACHE_DIR, f"{name}_{split}_{shard_index:06d}.bin")
+        write_datafile(filename, (all_tokens_np[:token_count]).tolist(), "gpt-2")
