@@ -6,10 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.3.3",
+    "scikit-learn>=1.8.0",
     "tomli-w>=1.2.0",
     "torch",
     "tyro>=0.9.31",
     "wandb>=0.21.4",
+    "dash>=2.0.0",
+    "plotly>=5.0.0",
 ]
 
 [tool.uv]
@@ -28,4 +31,17 @@ venvPath = "."
 venv = ".venv"
 
 [dependency-groups]
-dev = ["datasets>=4.0.0", "rich>=14.1.0", "ruff>=0.13.0", "tiktoken>=0.11.0"]
+dev = [
+    "datasets>=4.0.0",
+    "rich>=14.1.0",
+    "ruff>=0.13.0",
+    "tiktoken>=0.11.0",
+    "tokenizers>=0.22.0",
+    "transformers>=4.40.0",
+    "xxhash>=3.5.0",
+]
+# NOTE: collect_feature_activations.py requires sae-lens, which depends on
+# numpy<2 (via transformer-lens) and is incompatible with our numpy>=2.3.3.
+# Run it in a separate venv:
+#   uv venv .venv-sae && source .venv-sae/bin/activate
+#   uv pip install sae-lens datasets transformers torch
