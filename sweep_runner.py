@@ -352,7 +352,26 @@ def main_loop(args):
                 # Not in wandb at all — new work
                 lock_path = os.path.join(lock_dir, f"{rid}.lock")
                 if os.path.exists(lock_path):
-                    continue  # Already claimed by another process
+                    # Stale lock recovery: if lock exists but no checkpoint
+                    # was ever saved and the lock is old, the claiming worker
+                    # likely OOM'd or crashed before making progress.  Remove
+                    # the lock so another worker can pick it up.
+                    if not has_ckpt:
+                        try:
+                            lock_age = time.time() - os.path.getmtime(lock_path)
+                        except OSError:
+                            lock_age = 0
+                        if lock_age > 30 * 60:  # 30 minutes
+                            print(f"[sweep] Removing stale lock for {rid} "
+                                  f"(age {lock_age/60:.0f}m, no checkpoint)")
+                            try:
+                                os.remove(lock_path)
+                            except OSError:
+                                pass
+                        else:
+                            continue
+                    else:
+                        continue
                 claimable.append(c)
 
         # Priority: resume first, then new work
