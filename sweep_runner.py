@@ -18,6 +18,8 @@ import itertools
 import json
 import os
 import random
+import subprocess
+import sys
 import time
 from dataclasses import asdict, fields, replace
 from typing import Any
@@ -32,6 +34,39 @@ from src.experiment import cfg_hash, slug
 STORAGE_ROOT = os.environ.get(
     "TC_STORAGE_ROOT", "/mnt/pccfs2/backed_up/vin/dev/translation-compression"
 )
+
+
+def check_git_is_current() -> tuple[bool, str]:
+    """Check that local branch is not behind its remote tracking branch.
+
+    Returns (ok, message). ok is True if up-to-date or ahead.
+    """
+    try:
+        # Fetch latest remote refs (lightweight, no merge)
+        subprocess.run(
+            ["git", "fetch", "--quiet"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        # Compare local HEAD to upstream
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD..@{upstream}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            # No upstream configured — can't check, allow it
+            return True, "no upstream tracking branch configured"
+        behind = int(result.stdout.strip())
+        if behind > 0:
+            return False, f"local branch is {behind} commit(s) behind remote"
+        return True, "up to date"
+    except subprocess.TimeoutExpired:
+        return True, "git fetch timed out, skipping check"
+    except Exception as e:
+        return True, f"could not check git status: {e}"
 
 
 def parse_sweep_yaml(path: str) -> tuple[str | None, str, str | None, dict]:
@@ -441,7 +476,17 @@ def main():
                         help="Buffer wandb logs until checkpoint (for preemptible jobs)")
     parser.add_argument("--status", action="store_true",
                         help="Show status table and exit")
+    parser.add_argument("--allow-behind", action="store_true",
+                        help="Allow running even if local branch is behind remote")
     args = parser.parse_args()
+
+    if not args.status and not args.allow_behind:
+        ok, msg = check_git_is_current()
+        if not ok:
+            print(f"[sweep] ABORT: {msg}", file=sys.stderr)
+            print("[sweep] Pull the latest changes or pass --allow-behind to override.", file=sys.stderr)
+            sys.exit(1)
+        print(f"[sweep] Git check: {msg}")
 
     if args.status:
         print_status(args)
