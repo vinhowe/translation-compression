@@ -109,6 +109,10 @@ class Logging:
     # Folders; manager will ensure they exist
     log_folder: str = "out"
     checkpoint_folder: str = "out"
+    # If true, buffer wandb log calls and only flush after a checkpoint is saved.
+    # Use this on preemptible/time-limited Slurm jobs to keep wandb state in sync
+    # with checkpoint state.
+    wandb_buffer: bool = False
 
 
 # @dataclass(frozen=True)

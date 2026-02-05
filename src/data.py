@@ -40,6 +40,12 @@ class UniformBatchDataLoader:
         # ensure different stream per rank; deterministic across runs
         self._gen.manual_seed(int(self.seed) + int(self.process_rank))
 
+    def state_dict(self) -> dict:
+        return {"gen_state": self._gen.get_state()}
+
+    def load_state_dict(self, state: dict) -> None:
+        self._gen.set_state(state["gen_state"])
+
     def reset(self) -> None:
         # re-seed to initial state for deterministic epoch resets if needed
         self._gen.manual_seed(int(self.seed) + int(self.process_rank))
@@ -177,6 +183,16 @@ class UniformCompartmentDataLoader:
         self._kinds = np.empty(B, dtype=np.int64)
         self._srcs_np = np.empty(B, dtype=np.int64)
         self._dsts_np = np.empty(B, dtype=np.int64)
+
+    def state_dict(self) -> dict:
+        return {
+            "cat_rng_state": self._cat_rng.bit_generator.state,
+            "tok_gen_state": self._tok_gen.get_state(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self._cat_rng.bit_generator.state = state["cat_rng_state"]
+        self._tok_gen.set_state(state["tok_gen_state"])
 
     def reset(self) -> None:
         """Re-seed RNGs to initial state for deterministic resets."""
