@@ -35,7 +35,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.config.job_config import JobConfig, Model
 from src.config.manager import ConfigManager
-from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, write_meta
+from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, slug, write_meta
 from src.model import GPT
 from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
@@ -202,6 +202,19 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
+    def state_dict(self) -> dict:
+        return {
+            "current_shard": self.current_shard,
+            "current_position": self.current_position,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        shard = state["current_shard"]
+        if shard != self.current_shard:
+            self.current_shard = shard
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = state["current_position"]
+
     def next_batch(self):
         B = self.B
         T = self.T
@@ -358,6 +371,20 @@ class AssignmentsDataLoader:
         src = (w >> 16) & 0xFFFF
         dst = (w >> 32) & 0xFFFF
         return kind, src, dst
+
+    def state_dict(self) -> dict:
+        return {
+            "current_shard": self.current_shard,
+            "token_pos": self.token_pos,
+            "assignment_idx": self.assignment_idx,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        shard = state["current_shard"]
+        if shard != self.current_shard:
+            self._load_shard(shard)
+        self.token_pos = state["token_pos"]
+        self.assignment_idx = state["assignment_idx"]
 
     def reset(self) -> None:
         self._load_shard(0)
@@ -538,7 +565,9 @@ class AssignmentsDataLoader:
         return x_t, y_t, cids_t
 
 
-STORAGE_ROOT = "/nobackup/archive/grp/grp_pccl/vin/dev/translation-compression"
+STORAGE_ROOT = os.environ.get(
+    "TC_STORAGE_ROOT", "/mnt/pccfs2/backed_up/vin/dev/translation-compression"
+)
 
 
 def main(config: JobConfig) -> None:
@@ -580,14 +609,19 @@ def main(config: JobConfig) -> None:
     # I/O: structured run directory under hardcoded storage root
     run_id = os.environ.get("RUN_ID", uuid.uuid4().hex[:8])
     out_root = os.path.join(STORAGE_ROOT, "out")
-    project_dir, group_dir, out_dir = run_dirs(
-        out_root,
-        wandb_project,
-        wandb_group,
-        wandb_run_name,
-        config,
-        run_id,
-    )
+    if os.environ.get("OUT_DIR"):
+        out_dir = os.environ["OUT_DIR"]
+        project_dir = os.path.join(out_root, slug(wandb_project))
+        group_dir = os.path.join(project_dir, slug(wandb_group or "default"))
+    else:
+        project_dir, group_dir, out_dir = run_dirs(
+            out_root,
+            wandb_project,
+            wandb_group,
+            wandb_run_name,
+            config,
+            run_id,
+        )
     eval_interval = config.training.eval_interval
     log_interval = config.training.log_interval
     eval_iters = config.training.eval_iters
@@ -902,24 +936,74 @@ def main(config: JobConfig) -> None:
         if exp_cfg.permute_tokens_per_compartment
         else base_vocab * exp_cfg.n_compartments
     )
-    # Auto-resume from checkpoint if present; else allow gpt2 init; else scratch
-    ckpt_path = os.path.join(out_dir, "ckpt.pt")
-    if os.path.exists(ckpt_path):
-        print(f"Resuming training from checkpoint: {ckpt_path}")
-        checkpoint = cast(dict[str, Any], torch.load(ckpt_path, map_location=device))
-        checkpoint_model_args: dict[str, Any] = checkpoint["model_args"]
-        # create the model from checkpoint args
-        gptconf = Model(**checkpoint_model_args)
+    # Auto-resume from latest checkpoint if present; else init from scratch
+    ckpt_dir = os.path.join(out_dir, "checkpoints", "latest")
+    dataloader_state: Optional[dict] = None
+    if os.path.islink(ckpt_dir) or os.path.isdir(ckpt_dir):
+        model_ckpt = os.path.join(ckpt_dir, "model.pt")
+        trainer_state_path = os.path.join(ckpt_dir, "trainer_state.json")
+        if os.path.exists(model_ckpt) and os.path.exists(trainer_state_path):
+            print(f"Resuming training from checkpoint: {ckpt_dir}")
+            with open(trainer_state_path, "r") as f:
+                trainer_state = json.load(f)
+            iter_num = trainer_state["iter_num"]
+            best_val_loss = trainer_state.get("best_val_loss", 1e9)
+            # Load model state
+            model_state_dict = torch.load(model_ckpt, map_location=device)
+            # convert torch.compile state dict back to regular state dict
+            unwanted_prefix = "_orig_mod."
+            for k, v in list(model_state_dict.items()):
+                if k.startswith(unwanted_prefix):
+                    model_state_dict[k[len(unwanted_prefix) :]] = model_state_dict.pop(k)
+            checkpoint = {"model_state_dict": model_state_dict}
+            # Load optimizer state if present
+            opt_ckpt = os.path.join(ckpt_dir, "optimizer.pt")
+            if os.path.exists(opt_ckpt):
+                checkpoint["optimizer"] = torch.load(opt_ckpt, map_location=device)
+            # Load dataloader state if present
+            dl_ckpt = os.path.join(ckpt_dir, "dataloader.pt")
+            if os.path.exists(dl_ckpt):
+                dataloader_state = torch.load(dl_ckpt, map_location="cpu")
+    if checkpoint is not None:
+        # Build model config matching the current config (not from checkpoint)
+        vocab = composite_vocab
+        gptconf = Model(
+            **{
+                **asdict(config.model),
+                "vocab_size": vocab,
+                "embedding_vocab_size": (
+                    (base_vocab + 1)
+                    if config.experiment.shared_token_embeddings
+                    else vocab
+                ),
+                "shared_token_embeddings": bool(
+                    config.experiment.shared_token_embeddings
+                ),
+                "use_compartment_embeddings": bool(
+                    config.experiment.use_compartment_embeddings
+                ),
+                "copy_compartment_embeddings": (
+                    False
+                    if exp_cfg.permute_tokens_per_compartment
+                    else bool(config.experiment.copy_compartment_embeddings)
+                ),
+                "copy_compartment_lm_head": (
+                    False
+                    if exp_cfg.permute_tokens_per_compartment
+                    else bool(config.experiment.copy_compartment_lm_head)
+                ),
+                "base_vocab_size": base_vocab,
+                "max_compartments": exp_cfg.n_compartments,
+                "translation_token_id": translation_token_id_cfg,
+                "weight_tying": (
+                    False
+                    if config.experiment.shared_token_embeddings
+                    else config.model.weight_tying
+                ),
+            }
+        )
         model = GPT(gptconf)
-        state_dict = checkpoint["model"]
-        # convert torch.compile state dict back to regular state dict
-        unwanted_prefix = "_orig_mod."
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
-        iter_num = checkpoint["iter_num"]
-        best_val_loss = checkpoint["best_val_loss"]
+        model.load_state_dict(checkpoint["model_state_dict"])
     else:
         # init a new model from scratch
         print("Initializing a new model from scratch")
@@ -976,7 +1060,7 @@ def main(config: JobConfig) -> None:
     optimizer = model.configure_optimizers(
         weight_decay, learning_rate, (beta1, beta2), device_type
     )
-    if checkpoint is not None:
+    if checkpoint is not None and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])  # pyright: ignore[reportArgumentType]
     checkpoint = None  # free up memory
 
@@ -1079,6 +1163,13 @@ def main(config: JobConfig) -> None:
             )
         val_loader = None
 
+    # Restore dataloader state if resuming from checkpoint
+    if dataloader_state is not None:
+        print0(f"Restoring dataloader state from checkpoint (resuming at iter {iter_num})")
+        train_loader.load_state_dict(dataloader_state["train"])
+        if val_loader is not None and "val" in dataloader_state:
+            val_loader.load_state_dict(dataloader_state["val"])
+
     # helps estimate an arbitrarily accurate loss over either split using many batches
     @torch.no_grad()
     def estimate_loss():
@@ -1133,6 +1224,26 @@ def main(config: JobConfig) -> None:
         return learning_rate
 
     # logging
+    wandb_buffer_enabled = config.logging.wandb_buffer
+    wandb_log_buffer: list[tuple[dict, int]] = []  # list of (metrics_dict, step)
+
+    def wandb_log_or_buffer(metrics: dict, step: int) -> None:
+        """Log to wandb directly, or buffer if wandb_buffer is enabled."""
+        if wandb_buffer_enabled:
+            wandb_log_buffer.append((metrics, step))
+        else:
+            import wandb
+            wandb.log(metrics, step=step)
+
+    def wandb_flush_buffer() -> None:
+        """Flush all buffered wandb log entries."""
+        if not wandb_log_buffer:
+            return
+        import wandb
+        for metrics, step in wandb_log_buffer:
+            wandb.log(metrics, step=step)
+        wandb_log_buffer.clear()
+
     wandb_run: Optional[Any] = None
     if wandb_log and master_process:
         import wandb
@@ -1190,9 +1301,7 @@ def main(config: JobConfig) -> None:
                     f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
                 )
                 if wandb_log and master_process:
-                    import wandb
-
-                    wandb.log(
+                    wandb_log_or_buffer(
                         {
                             "iter": iter_num,
                             "train/loss": losses["train"],
@@ -1214,6 +1323,16 @@ def main(config: JobConfig) -> None:
             ck_root = os.path.join(out_dir, "checkpoints")
             step_dir = os.path.join(ck_root, f"step-{iter_num:06d}")
             os.makedirs(step_dir, exist_ok=True)
+            print(f"saving checkpoint to {step_dir}")
+            # Write all checkpoint files before updating the latest symlink,
+            # so a SIGKILL can't leave latest pointing at an incomplete checkpoint.
+            torch.save(raw_model.state_dict(), os.path.join(step_dir, "model.pt"))
+            torch.save(optimizer.state_dict(), os.path.join(step_dir, "optimizer.pt"))
+            # Save dataloader state for resumption
+            dl_state = {"train": train_loader.state_dict()}
+            if val_loader is not None:
+                dl_state["val"] = val_loader.state_dict()
+            torch.save(dl_state, os.path.join(step_dir, "dataloader.pt"))
             with open(os.path.join(step_dir, "trainer_state.json"), "w") as f:
                 json.dump(
                     {
@@ -1222,16 +1341,14 @@ def main(config: JobConfig) -> None:
                     },
                     f,
                 )
+            # Atomically update latest symlink (after all files are written)
             latest = os.path.join(ck_root, "latest")
-            if os.path.islink(latest) or os.path.exists(latest):
-                if os.path.islink(latest):
-                    os.unlink(latest)
-                else:
-                    shutil.rmtree(latest)
-            os.symlink(os.path.basename(step_dir), latest)
-            print(f"saving checkpoint to {step_dir}")
-            torch.save(raw_model.state_dict(), os.path.join(step_dir, "model.pt"))
-            torch.save(optimizer.state_dict(), os.path.join(step_dir, "optimizer.pt"))
+            tmp_link = latest + f".tmp.{os.getpid()}"
+            os.symlink(os.path.basename(step_dir), tmp_link)
+            os.replace(tmp_link, latest)
+            # Flush buffered wandb logs now that checkpoint is durable
+            if wandb_log and master_process and wandb_buffer_enabled:
+                wandb_flush_buffer()
 
         if iter_num == 0 and eval_only:
             break
@@ -1295,9 +1412,7 @@ def main(config: JobConfig) -> None:
                 f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%"
             )
             if wandb_log and master_process:
-                import wandb
-
-                wandb.log(
+                wandb_log_or_buffer(
                     {
                         "iter": iter_num,
                         "train/loss": lossf,
@@ -1313,6 +1428,10 @@ def main(config: JobConfig) -> None:
         # termination conditions
         if iter_num > max_iters:
             break
+
+    # Flush any remaining buffered wandb logs at normal termination
+    if wandb_log and master_process and wandb_buffer_enabled:
+        wandb_flush_buffer()
 
     if ddp:
         destroy_process_group()
