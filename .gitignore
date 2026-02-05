@@ -11,6 +11,13 @@ wheels/
 
 # Data
 data/fineweb10B*
+data/random*
 
 # Training outputs
 out/
+
+tokenizer/
+data/
+supercomputer-out/
+wandb/
+interpretability/
