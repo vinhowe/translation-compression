@@ -371,12 +371,23 @@ def main_loop(args):
         for c in ordered:
             rid = c["run_id"]
             if c.get("has_ckpt"):
-                # No need to claim — we already have a local checkpoint
+                # Lock file from the original claim already exists — that's
+                # expected.  Use a separate resume lock so only one worker
+                # picks up each checkpoint after preemption.
+                if not try_claim(lock_dir, rid + ".resume", args.cluster):
+                    print(f"[sweep] {rid} resume already claimed, trying next...")
+                    continue
                 print(
                     f"[sweep] Resuming {rid} (iter {c['iter_num']}) "
                     f"[{_override_summary(c['overrides'])}]"
                 )
                 run_training(c["config"], rid, c["out_dir"], args.cluster, args.wandb_buffer)
+                # Remove resume lock so a future preemption cycle can re-claim
+                resume_lock = os.path.join(lock_dir, f"{rid}.resume.lock")
+                try:
+                    os.remove(resume_lock)
+                except FileNotFoundError:
+                    pass
                 claimed = True
                 break
 
