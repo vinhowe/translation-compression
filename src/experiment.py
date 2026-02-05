@@ -10,8 +10,12 @@ from dataclasses import asdict
 from .config.job_config import JobConfig
 
 
-def _slug(s: str) -> str:
+def slug(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", s.strip())[:80].strip("-_.")
+
+
+# Keep the old name for internal callers
+_slug = slug
 
 
 def _canonical_cfg_dict(cfg: JobConfig) -> dict:
