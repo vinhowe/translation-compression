@@ -48,6 +48,9 @@ class Model:
     copy_compartment_lm_head: bool = False
     # vocab_size is derived from dataset meta by default
     vocab_size: int | None = None
+    # RoPE (Rotary Position Embeddings) - when enabled, learned positional embeddings are not used
+    use_rope: bool = False
+    rope_base: float = 10000.0
 
 
 @dataclass(frozen=True)

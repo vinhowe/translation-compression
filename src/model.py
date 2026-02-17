@@ -37,6 +37,66 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
+class RotaryPositionEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE) as described in RoFormer paper."""
+
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        # Precompute the inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Precompute cos and sin for max_seq_len positions
+        self._update_cos_sin_cache(max_seq_len)
+
+    def _update_cos_sin_cache(self, seq_len: int):
+        self.max_seq_len = seq_len
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # (seq_len, dim/2)
+        # Duplicate freqs for pairing: (seq_len, dim)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cos and sin for the given sequence length."""
+        if seq_len > self.max_seq_len:
+            self._update_cos_sin_cache(seq_len)
+        return (
+            self.cos_cached[:seq_len],
+            self.sin_cached[:seq_len],
+        )
+
+
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary position embeddings to query and key tensors.
+
+    Args:
+        q: Query tensor of shape (B, n_head, T, head_dim)
+        k: Key tensor of shape (B, n_head, T, head_dim)
+        cos: Cosine tensor of shape (T, head_dim)
+        sin: Sine tensor of shape (T, head_dim)
+
+    Returns:
+        Rotated q and k tensors
+    """
+    # Reshape cos and sin to broadcast: (1, 1, T, head_dim)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+
+    # Rotate half: split into two halves and rotate
+    def rotate_half(x):
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -51,8 +111,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.head_dim = config.n_embd // config.n_head
 
-    def forward(self, x):
+    def forward(self, x, rope_cos=None, rope_sin=None):
         B, T, C = (
             x.size()
         )  # batch size, sequence length, embedding dimensionality (n_embd)
@@ -65,6 +126,13 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, C // self.n_head)
             k = k.view(B, T, self.n_head, C // self.n_head)
             v = v.view(B, T, self.n_head, C // self.n_head)
+            # Apply RoPE if provided (need to transpose for apply_rotary_pos_emb)
+            if rope_cos is not None and rope_sin is not None:
+                q = q.transpose(1, 2)  # (B, nh, T, hs)
+                k = k.transpose(1, 2)
+                q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
+                q = q.transpose(1, 2)  # back to (B, T, nh, hs)
+                k = k.transpose(1, 2)
             y = flash_attn_func(q, k, v, causal=True,
                                dropout_p=self.dropout if self.training else 0.0)
             y = y.view(B, T, C)
@@ -73,6 +141,9 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+            # Apply RoPE if provided
+            if rope_cos is not None and rope_sin is not None:
+                q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=None,
                 dropout_p=self.dropout if self.training else 0,
@@ -109,8 +180,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, rope_cos=None, rope_sin=None):
+        x = x + self.attn(self.ln_1(x), rope_cos=rope_cos, rope_sin=rope_sin)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -142,17 +213,35 @@ class GPT(nn.Module):
         self.copy_compartment_lm_head: bool = bool(
             getattr(config, "copy_compartment_lm_head", False)
         )
+        # RoPE configuration
+        self.use_rope: bool = bool(getattr(config, "use_rope", False))
+        rope_base: float = float(getattr(config, "rope_base", 10000.0))
 
         print(f"embedding_vocab_size: {self.embedding_vocab_size}")
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(self.embedding_vocab_size, config.n_embd),
-                wpe=nn.Embedding(config.block_size, config.n_embd),
-                drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f=LayerNorm(config.n_embd, bias=config.bias),
-            )
+        print(f"use_rope: {self.use_rope}")
+
+        # Build transformer modules - conditionally include wpe based on use_rope
+        transformer_modules = dict(
+            wte=nn.Embedding(self.embedding_vocab_size, config.n_embd),
+            drop=nn.Dropout(config.dropout),
+            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f=LayerNorm(config.n_embd, bias=config.bias),
         )
+        # Only create learned positional embeddings if not using RoPE
+        if not self.use_rope:
+            transformer_modules["wpe"] = nn.Embedding(config.block_size, config.n_embd)
+        self.transformer = nn.ModuleDict(transformer_modules)
+
+        # Create RoPE module if enabled
+        if self.use_rope:
+            head_dim = config.n_embd // config.n_head
+            self.rotary_emb = RotaryPositionEmbedding(
+                dim=head_dim,
+                max_seq_len=config.block_size,
+                base=rope_base,
+            )
+        else:
+            self.rotary_emb = None
         # Optional compartment embeddings (max_compartments x n_embd)
         if self.use_compartment_embeddings:
             assert self.max_compartments is not None, (
@@ -237,7 +326,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and not self.use_rope:
             n_params -= cast(nn.Embedding, self.transformer.wpe).weight.numel()
         return n_params
 
@@ -261,7 +350,6 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, (
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         )
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
         # forward the GPT model itself
         # if using shared token embeddings, map tokens into embedding vocab via modulo for regular tokens
@@ -281,17 +369,28 @@ class GPT(nn.Module):
             tok_emb = cast(nn.Embedding, self.transformer.wte)(idx_mod)
         else:
             tok_emb = cast(nn.Embedding, self.transformer.wte)(idx)
-        pos_emb = cast(nn.Embedding, self.transformer.wpe)(
-            pos
-        )  # position embeddings of shape (t, n_embd)
-        x_input = tok_emb + pos_emb
+
+        # Position encoding: either learned embeddings or RoPE
+        if self.use_rope:
+            # RoPE: no positional embedding added to input, applied in attention
+            x_input = tok_emb
+            rope_cos, rope_sin = cast(RotaryPositionEmbedding, self.rotary_emb)(tok_emb, t)
+        else:
+            # Learned positional embeddings
+            pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+            pos_emb = cast(nn.Embedding, self.transformer.wpe)(
+                pos
+            )  # position embeddings of shape (t, n_embd)
+            x_input = tok_emb + pos_emb
+            rope_cos, rope_sin = None, None
+
         if self.use_compartment_embeddings and compartment_ids is not None:
             # compartment_ids shape (b, t)
             comp_emb = cast(nn.Embedding, self.comp_emb)(compartment_ids)
             x_input = x_input + comp_emb
         x = cast(nn.Dropout, self.transformer.drop)(x_input)
         for block in cast(nn.ModuleList, self.transformer.h):
-            x = block(x)
+            x = block(x, rope_cos=rope_cos, rope_sin=rope_sin)
         x = cast(nn.LayerNorm, self.transformer.ln_f)(x)
 
         # decide how to compute logits
@@ -318,9 +417,10 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size  # pyright: ignore[reportAttributeAccessIssue]
-        cast(nn.Embedding, self.transformer.wpe).weight = nn.Parameter(
-            cast(nn.Embedding, self.transformer.wpe).weight[:block_size]
-        )
+        if not self.use_rope:
+            cast(nn.Embedding, self.transformer.wpe).weight = nn.Parameter(
+                cast(nn.Embedding, self.transformer.wpe).weight[:block_size]
+            )
         for block in cast(nn.ModuleList, self.transformer.h):
             if hasattr(block.attn, "bias"):
                 cast(CausalSelfAttention, block.attn).bias = cast(
