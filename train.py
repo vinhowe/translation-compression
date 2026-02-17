@@ -937,7 +937,26 @@ def main(config: JobConfig) -> None:
         else base_vocab * exp_cfg.n_compartments
     )
     # Auto-resume from latest checkpoint if present; else init from scratch
-    ckpt_dir = os.path.join(out_dir, "checkpoints", "latest")
+    # Prefer the highest step-* checkpoint over the `latest` symlink,
+    # which can be stale if multiple workers raced on the same config.
+    ckpt_root = os.path.join(out_dir, "checkpoints")
+    ckpt_dir = os.path.join(ckpt_root, "latest")
+    if os.path.isdir(ckpt_root):
+        step_dirs = [
+            d for d in os.listdir(ckpt_root)
+            if d.startswith("step-") and os.path.isdir(os.path.join(ckpt_root, d))
+        ]
+        if step_dirs:
+            best_step_dir = max(step_dirs, key=lambda d: int(d.split("-", 1)[1]))
+            best_ckpt = os.path.join(ckpt_root, best_step_dir)
+            # Only override if this is actually newer than what latest points to
+            latest_target = None
+            if os.path.islink(ckpt_dir):
+                latest_target = os.readlink(ckpt_dir)
+            if latest_target != best_step_dir:
+                print(f"WARNING: latest symlink points to {latest_target}, "
+                      f"but highest checkpoint is {best_step_dir} — using highest")
+                ckpt_dir = best_ckpt
     dataloader_state: Optional[dict] = None
     if os.path.islink(ckpt_dir) or os.path.isdir(ckpt_dir):
         model_ckpt = os.path.join(ckpt_dir, "model.pt")
@@ -1342,10 +1361,24 @@ def main(config: JobConfig) -> None:
                     f,
                 )
             # Atomically update latest symlink (after all files are written)
+            # Only update if this step is >= the current latest to prevent
+            # a lagging worker from clobbering a newer checkpoint.
             latest = os.path.join(ck_root, "latest")
-            tmp_link = latest + f".tmp.{os.getpid()}"
-            os.symlink(os.path.basename(step_dir), tmp_link)
-            os.replace(tmp_link, latest)
+            should_update_latest = True
+            if os.path.islink(latest):
+                try:
+                    cur_target = os.readlink(latest)
+                    cur_step = int(cur_target.split("-", 1)[1])
+                    if iter_num < cur_step:
+                        should_update_latest = False
+                        print(f"WARNING: not updating latest symlink: current {cur_target} "
+                              f"is newer than step-{iter_num}")
+                except (ValueError, IndexError):
+                    pass  # malformed symlink target — overwrite it
+            if should_update_latest:
+                tmp_link = latest + f".tmp.{os.getpid()}"
+                os.symlink(os.path.basename(step_dir), tmp_link)
+                os.replace(tmp_link, latest)
             # Flush buffered wandb logs now that checkpoint is durable
             if wandb_log and master_process and wandb_buffer_enabled:
                 wandb_flush_buffer()
