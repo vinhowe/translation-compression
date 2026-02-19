@@ -632,7 +632,7 @@ def build(sweep_name, configs, rid_to_job, eta_tracker, n_jobs_run, n_jobs_pend,
         if n_h100:
             gpu_counts["H100"] = n_h100
     n_ckpt = sum(1 for c in configs if 0 < c["iter_num"] < c["max_iters"] and c["rid"] not in rid_to_job)
-    n_unclaimed = sum(1 for c in configs if c["iter_num"] == 0 and not c["locked"])
+    n_unclaimed = sum(1 for c in configs if c["iter_num"] == 0 and not c["locked"] and c["rid"] not in rid_to_job)
 
     # Overall ETA
     etas = [eta_tracker.eta_seconds(c["rid"], c["max_iters"])
