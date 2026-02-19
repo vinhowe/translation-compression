@@ -180,6 +180,12 @@ class Experiment:
     # also permuted. If False, inputs use the unpermuted base tokens while
     # targets remain in the permuted id space.
     permute_input_tokens_per_compartment: FlagConversionOff[bool] = True
+    # Translation sequence format:
+    # - "standard": [TRANS][src tokens][TRANS][dst tokens] (current behavior)
+    # - "interleaved": [TRANS][src chunk][dst chunk][src chunk][dst chunk]...
+    translation_mode: Literal["standard", "interleaved"] = "standard"
+    # Chunk size for interleaved translation mode (n-gram size)
+    translation_chunk_size: int = 4
 
 
 @dataclass(frozen=True)

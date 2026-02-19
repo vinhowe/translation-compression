@@ -1167,6 +1167,8 @@ def main(config: JobConfig) -> None:
                 permutations=uniform_perms,
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
                 pin_memory=True,
+                translation_mode=exp_cfg.translation_mode,
+                translation_chunk_size=exp_cfg.translation_chunk_size,
             )
         else:
             # Simple single-compartment uniform data (original behavior)

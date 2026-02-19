@@ -98,6 +98,10 @@ class UniformCompartmentDataLoader:
     permutations: Optional[np.ndarray] = None
     permute_inputs: bool = True
     pin_memory: bool = True
+    # Translation mode: "standard" or "interleaved"
+    translation_mode: Literal["standard", "interleaved"] = "standard"
+    # Chunk size for interleaved mode
+    translation_chunk_size: int = 4
 
     def __post_init__(self) -> None:
         self._pin = bool(self.pin_memory and torch.cuda.is_available())
@@ -268,6 +272,19 @@ class UniformCompartmentDataLoader:
         self, x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, m
     ):
         """Fill translation rows into output tensors."""
+        if self.translation_mode == "interleaved":
+            self._fill_translation_rows_interleaved(
+                x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, m
+            )
+        else:
+            self._fill_translation_rows_standard(
+                x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, m
+            )
+
+    def _fill_translation_rows_standard(
+        self, x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, m
+    ):
+        """Fill translation rows with standard format: [TRANS][src][TRANS][dst]."""
         half, T = self._half, self.T
         trans_token = self.translation_token_id
 
@@ -296,7 +313,7 @@ class UniformCompartmentDataLoader:
 
         # Build x for translation rows
         # Layout: [TRANS, src_content..., TRANS, dst_content...]
-        x_trans = x[idx_trans]
+        x_trans = torch.empty((m, T), dtype=x.dtype, device=x.device)
         x_trans[:, 0] = trans_token
         x_trans[:, half] = trans_token
         if self.permute_inputs:
@@ -308,7 +325,7 @@ class UniformCompartmentDataLoader:
 
         # Build y (next token prediction targets)
         # y[t] = x[t+1] for autoregressive, with permuted targets
-        y_trans = y[idx_trans]
+        y_trans = torch.empty((m, T), dtype=y.dtype, device=y.device)
         y_trans[:, 0] = content_src[:, 0]  # after first TRANS
         y_trans[:, 1:half - 1] = content_src[:, 1:]
         y_trans[:, half - 1] = trans_token  # predict second TRANS
@@ -317,9 +334,164 @@ class UniformCompartmentDataLoader:
         y_trans[:, -1] = -1  # ignore last position
 
         # Build cids
-        cids_trans = cids[idx_trans]
+        cids_trans = torch.empty((m, T), dtype=cids.dtype, device=cids.device)
         cids_trans[:, :half] = src_c.unsqueeze(1)
         cids_trans[:, half:] = dst_c.unsqueeze(1)
+
+        # Write back to output tensors
+        x[idx_trans] = x_trans
+        y[idx_trans] = y_trans
+        cids[idx_trans] = cids_trans
+
+    def _fill_translation_rows_interleaved(
+        self, x, y, cids, idx_trans, srcs_t, dsts_t, all_tokens, m
+    ):
+        """Fill translation rows with interleaved format: [TRANS][src_chunk][dst_chunk]..."""
+        T = self.T
+        chunk = self.translation_chunk_size
+        trans_token = self.translation_token_id
+
+        # Get source/dest compartments for translation rows
+        src_c = srcs_t[idx_trans]
+        dst_c = dsts_t[idx_trans]
+
+        # Calculate how many complete chunk pairs fit after TRANS token
+        # Layout: [TRANS][chunk_src][chunk_dst][chunk_src][chunk_dst]...
+        content_positions = T - 1  # positions after TRANS
+        pair_size = 2 * chunk
+        n_complete_pairs = content_positions // pair_size
+        remaining = content_positions - n_complete_pairs * pair_size
+
+        # Handle partial final chunks
+        # remaining positions split as: min(remaining, chunk) for src, rest for dst
+        partial_src = min(remaining, chunk)
+        partial_dst = remaining - partial_src
+
+        # Total content tokens needed (for complete pairs + partial)
+        n_content_tokens = n_complete_pairs * chunk + max(partial_src, partial_dst)
+
+        # Extract tokens for content (same content, different permutations)
+        tokens = all_tokens[: m * n_content_tokens].view(m, n_content_tokens)
+
+        # Apply permutations if needed
+        if self.permute_tokens and self._perm_torch is not None:
+            perm_src = self._perm_torch[src_c]  # (m, vocab)
+            perm_dst = self._perm_torch[dst_c]  # (m, vocab)
+            content_src = torch.gather(perm_src, 1, tokens)
+            content_dst = torch.gather(perm_dst, 1, tokens)
+        else:
+            base = self.base_vocab_size
+            content_src = tokens + (src_c * base).unsqueeze(1)
+            content_dst = tokens + (dst_c * base).unsqueeze(1)
+
+        # Build x for translation rows
+        x_trans = torch.zeros((m, T), dtype=x.dtype, device=x.device)
+        x_trans[:, 0] = trans_token
+
+        # Fill complete interleaved chunks
+        for p in range(n_complete_pairs):
+            src_start = p * chunk
+            src_end = src_start + chunk
+            x_src_start = 1 + p * pair_size
+            x_dst_start = x_src_start + chunk
+            if self.permute_inputs:
+                x_trans[:, x_src_start:x_src_start + chunk] = content_src[:, src_start:src_end]
+                x_trans[:, x_dst_start:x_dst_start + chunk] = content_dst[:, src_start:src_end]
+            else:
+                x_trans[:, x_src_start:x_src_start + chunk] = tokens[:, src_start:src_end]
+                x_trans[:, x_dst_start:x_dst_start + chunk] = tokens[:, src_start:src_end]
+
+        # Fill partial final chunks if any
+        if partial_src > 0:
+            partial_content_start = n_complete_pairs * chunk
+            x_partial_src_start = 1 + n_complete_pairs * pair_size
+            if self.permute_inputs:
+                x_trans[:, x_partial_src_start:x_partial_src_start + partial_src] = \
+                    content_src[:, partial_content_start:partial_content_start + partial_src]
+            else:
+                x_trans[:, x_partial_src_start:x_partial_src_start + partial_src] = \
+                    tokens[:, partial_content_start:partial_content_start + partial_src]
+
+            if partial_dst > 0:
+                x_partial_dst_start = x_partial_src_start + partial_src
+                if self.permute_inputs:
+                    x_trans[:, x_partial_dst_start:x_partial_dst_start + partial_dst] = \
+                        content_dst[:, partial_content_start:partial_content_start + partial_dst]
+                else:
+                    x_trans[:, x_partial_dst_start:x_partial_dst_start + partial_dst] = \
+                        tokens[:, partial_content_start:partial_content_start + partial_dst]
+
+        # Build y (next token prediction targets)
+        # y[t] = x[t+1] for autoregressive
+        y_trans = torch.full((m, T), -1, dtype=y.dtype, device=y.device)
+
+        # y[0] predicts x[1] (first src token after TRANS)
+        y_trans[:, 0] = content_src[:, 0]
+
+        # Fill y for complete pairs
+        for p in range(n_complete_pairs):
+            src_start = p * chunk
+            x_src_start = 1 + p * pair_size
+            x_dst_start = x_src_start + chunk
+
+            # Within src chunk: predict next src token, last src predicts first dst
+            for i in range(chunk - 1):
+                y_trans[:, x_src_start + i] = content_src[:, src_start + i + 1]
+            y_trans[:, x_src_start + chunk - 1] = content_dst[:, src_start]
+
+            # Within dst chunk: predict next dst token
+            for i in range(chunk - 1):
+                y_trans[:, x_dst_start + i] = content_dst[:, src_start + i + 1]
+
+            # Last dst token: predict first of next chunk (src or partial)
+            if p < n_complete_pairs - 1:
+                next_src_start = (p + 1) * chunk
+                y_trans[:, x_dst_start + chunk - 1] = content_src[:, next_src_start]
+            elif partial_src > 0:
+                # Predict first token of partial src chunk
+                y_trans[:, x_dst_start + chunk - 1] = content_src[:, n_complete_pairs * chunk]
+
+        # Fill y for partial chunks
+        if partial_src > 0:
+            partial_content_start = n_complete_pairs * chunk
+            x_partial_src_start = 1 + n_complete_pairs * pair_size
+
+            # Within partial src chunk
+            for i in range(partial_src - 1):
+                y_trans[:, x_partial_src_start + i] = content_src[:, partial_content_start + i + 1]
+
+            if partial_dst > 0:
+                # Last partial src predicts first partial dst
+                y_trans[:, x_partial_src_start + partial_src - 1] = content_dst[:, partial_content_start]
+
+                # Within partial dst chunk
+                x_partial_dst_start = x_partial_src_start + partial_src
+                for i in range(partial_dst - 1):
+                    y_trans[:, x_partial_dst_start + i] = content_dst[:, partial_content_start + i + 1]
+                # Last position is -1 (already set)
+
+        # Build cids - alternating src/dst for each chunk
+        cids_trans = torch.zeros((m, T), dtype=cids.dtype, device=cids.device)
+        cids_trans[:, 0] = src_c  # TRANS token gets src compartment id
+
+        for p in range(n_complete_pairs):
+            x_src_start = 1 + p * pair_size
+            x_dst_start = x_src_start + chunk
+            cids_trans[:, x_src_start:x_src_start + chunk] = src_c.unsqueeze(1)
+            cids_trans[:, x_dst_start:x_dst_start + chunk] = dst_c.unsqueeze(1)
+
+        # Partial chunks cids
+        if partial_src > 0:
+            x_partial_src_start = 1 + n_complete_pairs * pair_size
+            cids_trans[:, x_partial_src_start:x_partial_src_start + partial_src] = src_c.unsqueeze(1)
+            if partial_dst > 0:
+                x_partial_dst_start = x_partial_src_start + partial_src
+                cids_trans[:, x_partial_dst_start:x_partial_dst_start + partial_dst] = dst_c.unsqueeze(1)
+
+        # Write back to output tensors
+        x[idx_trans] = x_trans
+        y[idx_trans] = y_trans
+        cids[idx_trans] = cids_trans
 
     def _fill_compartment_rows(
         self, x, y, cids, idx_comp, srcs_t, all_tokens, token_offset, m
