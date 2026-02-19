@@ -193,6 +193,13 @@ class Experiment:
     dann_layers: str = ""
     # Discriminator hidden size. 0 = use n_embd.
     dann_disc_hidden: int = 0
+    # Token tying: share a subset of tokens across compartments
+    # "none" = no tying, "top_k" = tie most frequent tokens, "bottom_k" = tie least frequent
+    token_tying_mode: Literal["none", "top_k", "bottom_k"] = "none"
+    # Fraction of token mass that is *untied* (needs translation). 0 = all tied, 1 = none tied.
+    token_tying_ratio: float = 0.0
+    # Number of data shards to sample for frequency estimation
+    token_tying_freq_shards: int = 1
 
 
 @dataclass(frozen=True)
