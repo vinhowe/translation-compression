@@ -264,10 +264,10 @@ def get_running_map(
     # Stable jobs rarely cycle, so their "last N unique" rids are accurate.
     # Heavily-cycling jobs go last and pick up whatever remains.
     _CLAIM_RE = re.compile(
-        r"\[sweep\] (?:Claimed|Resuming) (?P<rid>[a-f0-9]{8})"
+        r"\[sweep(?:-poll)?\] (?:Claimed|Resuming|Assigned) (?P<rid>[a-f0-9]{8})"
         r"(?:[^\[]*\[(?P<summary>[^\]]+)\])?"
     )
-    _COMPLETE_RE = re.compile(r"\[sweep\] Training complete\.")
+    _COMPLETE_RE = re.compile(r"\[sweep(?:-poll)?\] Training complete")
 
     job_candidates: dict[str, list[str]] = {}   # jobid -> rids newest-first
     job_active_count: dict[str, int] = {}
