@@ -569,6 +569,34 @@ STORAGE_ROOT = os.environ.get(
     "TC_STORAGE_ROOT", "/mnt/pccfs2/backed_up/vin/dev/translation-compression"
 )
 
+ROLLING_CHECKPOINT_INTERVAL = 1000
+
+
+def _save_rolling_checkpoint(out_dir, raw_model, optimizer, train_loader,
+                             val_loader, iter_num, best_val_loss):
+    """Save a rolling 'latest' checkpoint for preemption resilience.
+
+    Overwrites a single _rolling/ directory each time. trainer_state.json is
+    written last so its presence signals a complete checkpoint.
+    """
+    ck_root = os.path.join(out_dir, "checkpoints")
+    rolling_dir = os.path.join(ck_root, "_rolling")
+    os.makedirs(rolling_dir, exist_ok=True)
+    torch.save(raw_model.state_dict(), os.path.join(rolling_dir, "model.pt"))
+    torch.save(optimizer.state_dict(), os.path.join(rolling_dir, "optimizer.pt"))
+    dl_state = {"train": train_loader.state_dict()}
+    if val_loader is not None:
+        dl_state["val"] = val_loader.state_dict()
+    torch.save(dl_state, os.path.join(rolling_dir, "dataloader.pt"))
+    # Write trainer_state.json LAST — its existence signals a complete checkpoint
+    with open(os.path.join(rolling_dir, "trainer_state.json"), "w") as f:
+        json.dump({"iter_num": iter_num, "best_val_loss": float(best_val_loss)}, f)
+    # Update latest symlink to point to _rolling
+    latest = os.path.join(ck_root, "latest")
+    tmp_link = latest + f".tmp.{os.getpid()}"
+    os.symlink("_rolling", tmp_link)
+    os.replace(tmp_link, latest)
+
 
 def main(config: JobConfig) -> None:
     # Apply size tier overrides (if provided) and mirror assignment_seed to training.seed
@@ -937,52 +965,92 @@ def main(config: JobConfig) -> None:
         else base_vocab * exp_cfg.n_compartments
     )
     # Auto-resume from latest checkpoint if present; else init from scratch
-    # Prefer the highest step-* checkpoint over the `latest` symlink,
-    # which can be stale if multiple workers raced on the same config.
+    # Prefer the highest step-* or rolling checkpoint, whichever is newer.
     ckpt_root = os.path.join(out_dir, "checkpoints")
-    ckpt_dir = os.path.join(ckpt_root, "latest")
+    ckpt_dir = os.path.join(ckpt_root, "latest")  # fallback
+    best_named_dir = None
+    best_named_iter = -1
     if os.path.isdir(ckpt_root):
+        # Find highest named checkpoint
         step_dirs = [
             d for d in os.listdir(ckpt_root)
             if d.startswith("step-") and os.path.isdir(os.path.join(ckpt_root, d))
         ]
         if step_dirs:
             best_step_dir = max(step_dirs, key=lambda d: int(d.split("-", 1)[1]))
-            best_ckpt = os.path.join(ckpt_root, best_step_dir)
-            # Only override if this is actually newer than what latest points to
-            latest_target = None
-            if os.path.islink(ckpt_dir):
-                latest_target = os.readlink(ckpt_dir)
-            if latest_target != best_step_dir:
-                print(f"WARNING: latest symlink points to {latest_target}, "
-                      f"but highest checkpoint is {best_step_dir} — using highest")
-                ckpt_dir = best_ckpt
+            best_named_iter = int(best_step_dir.split("-", 1)[1])
+            best_named_dir = os.path.join(ckpt_root, best_step_dir)
+            ckpt_dir = best_named_dir
+
+        # Check rolling checkpoint (may be newer than highest named)
+        rolling_dir = os.path.join(ckpt_root, "_rolling")
+        rolling_state_path = os.path.join(rolling_dir, "trainer_state.json")
+        if os.path.exists(rolling_state_path):
+            try:
+                with open(rolling_state_path) as f:
+                    rolling_iter = json.load(f).get("iter_num", -1)
+                if rolling_iter > best_named_iter:
+                    ckpt_dir = rolling_dir
+            except (json.JSONDecodeError, OSError):
+                pass  # corrupt rolling checkpoint — ignore it
+
     dataloader_state: Optional[dict] = None
     if os.path.islink(ckpt_dir) or os.path.isdir(ckpt_dir):
         model_ckpt = os.path.join(ckpt_dir, "model.pt")
         trainer_state_path = os.path.join(ckpt_dir, "trainer_state.json")
         if os.path.exists(model_ckpt) and os.path.exists(trainer_state_path):
             print(f"Resuming training from checkpoint: {ckpt_dir}")
-            with open(trainer_state_path, "r") as f:
-                trainer_state = json.load(f)
-            iter_num = trainer_state["iter_num"]
-            best_val_loss = trainer_state.get("best_val_loss", 1e9)
-            # Load model state
-            model_state_dict = torch.load(model_ckpt, map_location=device)
-            # convert torch.compile state dict back to regular state dict
-            unwanted_prefix = "_orig_mod."
-            for k, v in list(model_state_dict.items()):
-                if k.startswith(unwanted_prefix):
-                    model_state_dict[k[len(unwanted_prefix) :]] = model_state_dict.pop(k)
-            checkpoint = {"model_state_dict": model_state_dict}
-            # Load optimizer state if present
-            opt_ckpt = os.path.join(ckpt_dir, "optimizer.pt")
-            if os.path.exists(opt_ckpt):
-                checkpoint["optimizer"] = torch.load(opt_ckpt, map_location=device)
-            # Load dataloader state if present
-            dl_ckpt = os.path.join(ckpt_dir, "dataloader.pt")
-            if os.path.exists(dl_ckpt):
-                dataloader_state = torch.load(dl_ckpt, map_location="cpu")
+            try:
+                with open(trainer_state_path, "r") as f:
+                    trainer_state = json.load(f)
+                iter_num = trainer_state["iter_num"]
+                best_val_loss = trainer_state.get("best_val_loss", 1e9)
+                # Load model state
+                model_state_dict = torch.load(model_ckpt, map_location=device)
+                # convert torch.compile state dict back to regular state dict
+                unwanted_prefix = "_orig_mod."
+                for k, v in list(model_state_dict.items()):
+                    if k.startswith(unwanted_prefix):
+                        model_state_dict[k[len(unwanted_prefix) :]] = model_state_dict.pop(k)
+                checkpoint = {"model_state_dict": model_state_dict}
+                # Load optimizer state if present
+                opt_ckpt = os.path.join(ckpt_dir, "optimizer.pt")
+                if os.path.exists(opt_ckpt):
+                    checkpoint["optimizer"] = torch.load(opt_ckpt, map_location=device)
+                # Load dataloader state if present
+                dl_ckpt = os.path.join(ckpt_dir, "dataloader.pt")
+                if os.path.exists(dl_ckpt):
+                    dataloader_state = torch.load(dl_ckpt, map_location="cpu")
+            except Exception as e:
+                if "_rolling" in str(ckpt_dir):
+                    print(f"WARNING: corrupt rolling checkpoint, falling back to named: {e}")
+                    checkpoint = None
+                    dataloader_state = None
+                    # Fall back to best named checkpoint
+                    if best_named_dir is not None:
+                        ckpt_dir = best_named_dir
+                        model_ckpt = os.path.join(ckpt_dir, "model.pt")
+                        trainer_state_path = os.path.join(ckpt_dir, "trainer_state.json")
+                        if os.path.exists(model_ckpt) and os.path.exists(trainer_state_path):
+                            print(f"Resuming from named checkpoint: {ckpt_dir}")
+                            with open(trainer_state_path, "r") as f:
+                                trainer_state = json.load(f)
+                            iter_num = trainer_state["iter_num"]
+                            best_val_loss = trainer_state.get("best_val_loss", 1e9)
+                            model_state_dict = torch.load(model_ckpt, map_location=device)
+                            unwanted_prefix = "_orig_mod."
+                            for k, v in list(model_state_dict.items()):
+                                if k.startswith(unwanted_prefix):
+                                    model_state_dict[k[len(unwanted_prefix) :]] = model_state_dict.pop(k)
+                            checkpoint = {"model_state_dict": model_state_dict}
+                            opt_ckpt = os.path.join(ckpt_dir, "optimizer.pt")
+                            if os.path.exists(opt_ckpt):
+                                checkpoint["optimizer"] = torch.load(opt_ckpt, map_location=device)
+                            dl_ckpt = os.path.join(ckpt_dir, "dataloader.pt")
+                            if os.path.exists(dl_ckpt):
+                                dataloader_state = torch.load(dl_ckpt, map_location="cpu")
+                else:
+                    raise
     if checkpoint is not None:
         # Build model config matching the current config (not from checkpoint)
         vocab = composite_vocab
@@ -1382,6 +1450,20 @@ def main(config: JobConfig) -> None:
             # Flush buffered wandb logs now that checkpoint is durable
             if wandb_log and master_process and wandb_buffer_enabled:
                 wandb_flush_buffer()
+
+        # Rolling "latest" checkpoint for preemption resilience.
+        # Skip if a named checkpoint was already saved this step.
+        if (
+            master_process
+            and ROLLING_CHECKPOINT_INTERVAL > 0
+            and iter_num > 0
+            and iter_num % ROLLING_CHECKPOINT_INTERVAL == 0
+            and not (iter_num % eval_interval == 0 or iter_num in checkpoint_steps)
+        ):
+            _save_rolling_checkpoint(
+                out_dir, raw_model, optimizer, train_loader,
+                val_loader, iter_num, best_val_loss,
+            )
 
         if iter_num == 0 and eval_only:
             break
