@@ -39,7 +39,7 @@ from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, slug, w
 from src.model import GPT
 from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
-from src.token_tying import compute_token_frequencies, compute_tied_mask, apply_tying_to_permutations
+from src.token_tying import compute_token_frequencies, compute_tied_mask, apply_tying_to_permutations, build_tying_remap
 from src.config.presets import apply_size_tier, apply_bpe16384_batch_config
 from src.weights import compute_weights_map
 import struct
@@ -248,6 +248,8 @@ class AssignmentsDataLoader:
         permute_inputs: bool = True,
         pin_memory: bool = True,
         tied_token_mask: Optional[np.ndarray] = None,
+        tying_remap: Optional[np.ndarray] = None,
+        translation_token_id: Optional[int] = None,
     ) -> None:
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -259,8 +261,9 @@ class AssignmentsDataLoader:
         self.permute_tokens = permute_tokens
         self.permute_inputs = permute_inputs
         self._tied_token_mask = tied_token_mask  # bool[base_vocab_size] or None
+        self._tying_remap = tying_remap  # int64[n_compartments, base_vocab] or None
         # translation token id differs by mode; uses n_compartments to match model vocab size
-        self.translation_token_id = (
+        self.translation_token_id = translation_token_id if translation_token_id is not None else (
             base_vocab_size if permute_tokens else base_vocab_size * n_compartments
         )
         # Optionally load permutations array of shape [max_compartments, base_vocab]
@@ -481,18 +484,20 @@ class AssignmentsDataLoader:
                 seq_out[:, 1:half] = perm_src
                 seq_out[:, half + 1 :] = perm_dst
             else:
-                base = self.base_vocab_size
                 token_slice = samples[:, : half - 1]
-                if self._tied_token_mask is not None:
-                    # Tied tokens get offset 0; untied tokens get compartment offset
-                    tied_slice = self._tied_token_mask[token_slice]  # bool mask
-                    src_off = np.where(tied_slice, 0, srcs[idx_trans][:, None] * base)
-                    dst_off = np.where(tied_slice, 0, dsts[idx_trans][:, None] * base)
+                if self._tying_remap is not None:
+                    # Compact remap: remap[comp, base_token] -> compact_id
+                    remap = self._tying_remap
+                    src_comp = srcs[idx_trans]
+                    dst_comp = dsts[idx_trans]
+                    seq_in[:, 1:half] = remap[src_comp[:, None], token_slice]
+                    seq_in[:, half + 1 :] = remap[dst_comp[:, None], token_slice]
                 else:
+                    base = self.base_vocab_size
                     src_off = srcs[idx_trans][:, None] * base
                     dst_off = dsts[idx_trans][:, None] * base
-                seq_in[:, 1:half] = token_slice + src_off
-                seq_in[:, half + 1 :] = token_slice + dst_off
+                    seq_in[:, 1:half] = token_slice + src_off
+                    seq_in[:, half + 1 :] = token_slice + dst_off
                 # Without permutation, inputs and outputs are identical
                 seq_out[:, 1:half] = seq_in[:, 1:half]
                 seq_out[:, half + 1 :] = seq_in[:, half + 1 :]
@@ -532,13 +537,14 @@ class AssignmentsDataLoader:
                 y_comp[:, :-1] = perm_samples[:, 1:]
                 y_comp[:, -1] = -1
             else:
-                base = self.base_vocab_size
-                if self._tied_token_mask is not None:
-                    tied_slice = self._tied_token_mask[samples]  # bool mask
-                    src_off = np.where(tied_slice, 0, srcs[idx_comp][:, None] * base)
+                if self._tying_remap is not None:
+                    remap = self._tying_remap
+                    src_comp = srcs[idx_comp]
+                    x_comp = remap[src_comp[:, None], samples]
                 else:
+                    base = self.base_vocab_size
                     src_off = srcs[idx_comp][:, None] * base
-                x_comp = samples + src_off
+                    x_comp = samples + src_off
                 y_comp = np.empty_like(x_comp)
                 y_comp[:, :-1] = x_comp[:, 1:]
                 y_comp[:, -1] = -1
@@ -994,6 +1000,18 @@ def main(config: JobConfig) -> None:
             if ddp:
                 torch.distributed.barrier()
 
+    # Build compact remap table for offset mode tying
+    tying_remap: Optional[np.ndarray] = None
+    tying_compact_vocab: Optional[int] = None
+    if tied_token_mask is not None and not config.experiment.permute_tokens_per_compartment:
+        tying_remap, tying_compact_vocab = build_tying_remap(
+            tied_token_mask, config.experiment.n_compartments
+        )
+        print0(
+            f"Compact vocab: {tying_compact_vocab + 1} "
+            f"(vs {config.model.vocab_size * config.experiment.n_compartments + 1} without tying)"
+        )
+
     torch.manual_seed(training_seed)
     torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
@@ -1030,18 +1048,21 @@ def main(config: JobConfig) -> None:
         )
     # If permuting per compartment, vocabulary is base_vocab + 1 (only translation token)
     # Otherwise, it's base_vocab * n_compartments + 1 (offset scheme)
+    # With token tying compact layout, vocab shrinks to base_vocab + (n_comp-1)*n_untied + 1
     # Note: we use n_compartments (not max_compartments) to size the model efficiently
-    composite_vocab = (
-        base_vocab + 1
-        if exp_cfg.permute_tokens_per_compartment
-        else base_vocab * exp_cfg.n_compartments + 1
-    )
-    # Translation token id differs by mode
-    translation_token_id_cfg = (
-        base_vocab
-        if exp_cfg.permute_tokens_per_compartment
-        else base_vocab * exp_cfg.n_compartments
-    )
+    if tying_compact_vocab is not None:
+        composite_vocab = tying_compact_vocab + 1  # +1 for translation token
+    elif exp_cfg.permute_tokens_per_compartment:
+        composite_vocab = base_vocab + 1
+    else:
+        composite_vocab = base_vocab * exp_cfg.n_compartments + 1
+    # Translation token id is always the last id in the vocab
+    if tying_compact_vocab is not None:
+        translation_token_id_cfg = tying_compact_vocab
+    elif exp_cfg.permute_tokens_per_compartment:
+        translation_token_id_cfg = base_vocab
+    else:
+        translation_token_id_cfg = base_vocab * exp_cfg.n_compartments
     # Auto-resume from latest checkpoint if present; else init from scratch
     # Prefer the highest step-* checkpoint over the `latest` symlink,
     # which can be stale if multiple workers raced on the same config.
@@ -1218,6 +1239,8 @@ def main(config: JobConfig) -> None:
             ),
             permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
             tied_token_mask=tied_token_mask,
+            tying_remap=tying_remap,
+            translation_token_id=translation_token_id_cfg,
         )
         val_loader = None
         if val_bin:
@@ -1239,6 +1262,8 @@ def main(config: JobConfig) -> None:
                 ),
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
                 tied_token_mask=tied_token_mask,
+                tying_remap=tying_remap,
+                translation_token_id=translation_token_id_cfg,
             )
     else:
         # Uniform synthetic stream
@@ -1278,6 +1303,8 @@ def main(config: JobConfig) -> None:
                 permutations=uniform_perms,
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
                 tied_token_mask=tied_token_mask,
+                tying_remap=tying_remap,
+                translation_token_id_override=translation_token_id_cfg if tying_remap is not None else None,
                 pin_memory=True,
             )
         else:

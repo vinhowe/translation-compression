@@ -134,3 +134,47 @@ def apply_tying_to_permutations(
         new_perms[c, untied_indices] = sorted_untied[rank]
 
     return new_perms
+
+
+def build_tying_remap(
+    tied_mask: np.ndarray, n_compartments: int
+) -> tuple[np.ndarray, int]:
+    """Build a compact remapping table for offset-mode token tying.
+
+    Produces a table of shape [n_compartments, base_vocab_size] where
+    remap[c, token] gives the compact ID for that (compartment, token) pair.
+
+    Layout:
+    - Compartment 0: all tokens keep their base IDs [0, base_vocab)
+    - Compartment c > 0, tied token: maps to base ID (shared with comp 0)
+    - Compartment c > 0, untied token: maps to base_vocab + (c-1)*n_untied + rank
+
+    Args:
+        tied_mask: bool array of shape [base_vocab_size] — True = tied.
+        n_compartments: Number of compartments.
+
+    Returns:
+        (remap, compact_vocab_size) where remap is int64 [n_compartments, base_vocab]
+        and compact_vocab_size excludes the translation token (caller adds +1).
+    """
+    base_vocab = len(tied_mask)
+    untied_indices = np.nonzero(~tied_mask)[0]
+    n_untied = len(untied_indices)
+
+    # Build rank lookup: for each untied base token, its position among untied tokens
+    untied_rank = np.empty(base_vocab, dtype=np.int64)
+    untied_rank[untied_indices] = np.arange(n_untied, dtype=np.int64)
+
+    remap = np.empty((n_compartments, base_vocab), dtype=np.int64)
+
+    # Compartment 0: identity
+    remap[0] = np.arange(base_vocab, dtype=np.int64)
+
+    for c in range(1, n_compartments):
+        # Tied tokens: same as base ID
+        remap[c] = np.arange(base_vocab, dtype=np.int64)  # start with identity
+        # Untied tokens: compact offset
+        remap[c, untied_indices] = base_vocab + (c - 1) * n_untied + untied_rank[untied_indices]
+
+    compact_vocab_size = base_vocab + (n_compartments - 1) * n_untied
+    return remap, compact_vocab_size

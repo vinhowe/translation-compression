@@ -98,6 +98,8 @@ class UniformCompartmentDataLoader:
     permutations: Optional[np.ndarray] = None
     permute_inputs: bool = True
     tied_token_mask: Optional[np.ndarray] = None
+    tying_remap: Optional[np.ndarray] = None
+    translation_token_id_override: Optional[int] = None
     pin_memory: bool = True
 
     def __post_init__(self) -> None:
@@ -141,11 +143,14 @@ class UniformCompartmentDataLoader:
         self._num_categories = len(cat_kinds)
 
         # Translation token id - uses n_compartments to match model vocab size
-        self.translation_token_id = (
-            self.base_vocab_size
-            if self.permute_tokens
-            else self.base_vocab_size * self.n_compartments
-        )
+        if self.translation_token_id_override is not None:
+            self.translation_token_id = self.translation_token_id_override
+        else:
+            self.translation_token_id = (
+                self.base_vocab_size
+                if self.permute_tokens
+                else self.base_vocab_size * self.n_compartments
+            )
 
         # Initialize RNGs with different seeds for categories vs tokens
         self._cat_rng = np.random.Generator(
@@ -159,6 +164,12 @@ class UniformCompartmentDataLoader:
             self._tied_mask_torch = torch.from_numpy(self.tied_token_mask).bool()
         else:
             self._tied_mask_torch = None
+
+        # Store tying remap as torch tensor for compact vocab layout
+        if self.tying_remap is not None:
+            self._remap_torch = torch.from_numpy(self.tying_remap).long()
+        else:
+            self._remap_torch = None
 
         # Store permutations as torch tensor for faster indexing
         if self.permutations is not None:
@@ -297,16 +308,14 @@ class UniformCompartmentDataLoader:
             content_dst = torch.gather(perm_dst, 1, content)
         else:
             # Offset-based (no permutation)
-            base = self.base_vocab_size
-            if self._tied_mask_torch is not None:
-                tied_slice = self._tied_mask_torch[content]  # bool [m, half-1]
-                src_off = torch.where(tied_slice, 0, (src_c * base).unsqueeze(1))
-                dst_off = torch.where(tied_slice, 0, (dst_c * base).unsqueeze(1))
+            if self._remap_torch is not None:
+                # Compact remap: remap[comp, base_token] -> compact_id
+                content_src = self._remap_torch[src_c.unsqueeze(1).expand_as(content), content]
+                content_dst = self._remap_torch[dst_c.unsqueeze(1).expand_as(content), content]
             else:
-                src_off = (src_c * base).unsqueeze(1)
-                dst_off = (dst_c * base).unsqueeze(1)
-            content_src = content + src_off
-            content_dst = content + dst_off
+                base = self.base_vocab_size
+                content_src = content + (src_c * base).unsqueeze(1)
+                content_dst = content + (dst_c * base).unsqueeze(1)
 
         # Build x for translation rows
         # Layout: [TRANS, src_content..., TRANS, dst_content...]
@@ -363,13 +372,11 @@ class UniformCompartmentDataLoader:
             y_comp[:, :-1] = perm_tokens[:, 1:]
             y_comp[:, -1] = -1
         else:
-            base = self.base_vocab_size
-            if self._tied_mask_torch is not None:
-                tied_slice = self._tied_mask_torch[tokens]  # bool [m, T]
-                src_off = torch.where(tied_slice, 0, (src_c * base).unsqueeze(1))
+            if self._remap_torch is not None:
+                x_comp = self._remap_torch[src_c.unsqueeze(1).expand_as(tokens), tokens]
             else:
-                src_off = (src_c * base).unsqueeze(1)
-            x_comp = tokens + src_off
+                base = self.base_vocab_size
+                x_comp = tokens + (src_c * base).unsqueeze(1)
             y_comp = torch.empty_like(x_comp)
             y_comp[:, :-1] = x_comp[:, 1:]
             y_comp[:, -1] = -1
