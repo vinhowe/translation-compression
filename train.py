@@ -39,6 +39,7 @@ from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, slug, w
 from src.model import GPT
 from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
+from src.token_tying import compute_token_frequencies, compute_tied_mask, apply_tying_to_permutations
 from src.config.presets import apply_size_tier, apply_bpe16384_batch_config
 from src.weights import compute_weights_map
 import struct
@@ -246,6 +247,7 @@ class AssignmentsDataLoader:
         permutations_path: Optional[str] = None,
         permute_inputs: bool = True,
         pin_memory: bool = True,
+        tied_token_mask: Optional[np.ndarray] = None,
     ) -> None:
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -256,6 +258,7 @@ class AssignmentsDataLoader:
         self.n_compartments = n_compartments
         self.permute_tokens = permute_tokens
         self.permute_inputs = permute_inputs
+        self._tied_token_mask = tied_token_mask  # bool[base_vocab_size] or None
         # translation token id differs by mode; uses n_compartments to match model vocab size
         self.translation_token_id = (
             base_vocab_size if permute_tokens else base_vocab_size * n_compartments
@@ -479,10 +482,17 @@ class AssignmentsDataLoader:
                 seq_out[:, half + 1 :] = perm_dst
             else:
                 base = self.base_vocab_size
-                src_offsets = srcs[idx_trans] * base
-                dst_offsets = dsts[idx_trans] * base
-                seq_in[:, 1:half] = samples[:, : half - 1] + src_offsets[:, None]
-                seq_in[:, half + 1 :] = samples[:, : half - 1] + dst_offsets[:, None]
+                token_slice = samples[:, : half - 1]
+                if self._tied_token_mask is not None:
+                    # Tied tokens get offset 0; untied tokens get compartment offset
+                    tied_slice = self._tied_token_mask[token_slice]  # bool mask
+                    src_off = np.where(tied_slice, 0, srcs[idx_trans][:, None] * base)
+                    dst_off = np.where(tied_slice, 0, dsts[idx_trans][:, None] * base)
+                else:
+                    src_off = srcs[idx_trans][:, None] * base
+                    dst_off = dsts[idx_trans][:, None] * base
+                seq_in[:, 1:half] = token_slice + src_off
+                seq_in[:, half + 1 :] = token_slice + dst_off
                 # Without permutation, inputs and outputs are identical
                 seq_out[:, 1:half] = seq_in[:, 1:half]
                 seq_out[:, half + 1 :] = seq_in[:, half + 1 :]
@@ -523,8 +533,12 @@ class AssignmentsDataLoader:
                 y_comp[:, -1] = -1
             else:
                 base = self.base_vocab_size
-                src_offsets = srcs[idx_comp] * base
-                x_comp = samples + src_offsets[:, None]
+                if self._tied_token_mask is not None:
+                    tied_slice = self._tied_token_mask[samples]  # bool mask
+                    src_off = np.where(tied_slice, 0, srcs[idx_comp][:, None] * base)
+                else:
+                    src_off = srcs[idx_comp][:, None] * base
+                x_comp = samples + src_off
                 y_comp = np.empty_like(x_comp)
                 y_comp[:, :-1] = x_comp[:, 1:]
                 y_comp[:, -1] = -1
@@ -888,6 +902,98 @@ def main(config: JobConfig) -> None:
     # Ensure all processes wait for assignments/permutations if using pretokenized data
     if ddp and use_pretokenized:
         torch.distributed.barrier()
+
+    # --- Token tying: compute frequency cache and tied mask ---
+    tied_token_mask: Optional[np.ndarray] = None
+    if config.experiment.token_tying_mode != "none" and use_pretokenized:
+        import hashlib
+
+        _tying_vocab = config.model.vocab_size
+        if _tying_vocab is None:
+            raise ValueError("model.vocab_size must be set for token tying")
+
+        freq_shards = config.experiment.token_tying_freq_shards
+        data_hash = hashlib.sha256(train_bin.encode()).hexdigest()[:12]
+        freq_cache_name = f"token_freqs_v{_tying_vocab}_d{data_hash}_s{freq_shards}.npy"
+        freq_cache_dir = os.path.join(STORAGE_ROOT, "cache")
+        freq_cache_path = os.path.join(freq_cache_dir, freq_cache_name)
+
+        # Compute/load frequency cache (lock-based write-once, master only writes)
+        if master_process:
+            os.makedirs(freq_cache_dir, exist_ok=True)
+            if not os.path.exists(freq_cache_path):
+                lock_path = freq_cache_path + ".lock"
+                tmp_path = freq_cache_path + f".tmp.{os.getpid()}"
+                acquired = False
+                while True:
+                    try:
+                        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                        os.close(fd)
+                        acquired = True
+                        break
+                    except FileExistsError:
+                        if os.path.exists(freq_cache_path):
+                            break
+                        time.sleep(0.1)
+                if acquired:
+                    try:
+                        freqs = compute_token_frequencies(
+                            train_bin, _tying_vocab, max_shards=freq_shards
+                        )
+                        with open(tmp_path, "wb") as f:
+                            np.save(f, freqs)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp_path, freq_cache_path)
+                        print0(f"Wrote token frequency cache to {freq_cache_path}")
+                    finally:
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        try:
+                            os.remove(lock_path)
+                        except Exception:
+                            pass
+                else:
+                    print0(f"Using cached token frequencies at {freq_cache_path}")
+            else:
+                print0(f"Using cached token frequencies at {freq_cache_path}")
+
+        if ddp:
+            torch.distributed.barrier()
+
+        # All processes load the frequency cache and compute the tied mask
+        freqs = np.load(freq_cache_path)
+        tied_token_mask = compute_tied_mask(
+            freqs, config.experiment.token_tying_mode, config.experiment.token_tying_ratio
+        )
+        n_tied = int(tied_token_mask.sum())
+        tied_mass_frac = float(freqs[tied_token_mask].sum()) / max(1, float(freqs.sum()))
+        print0(
+            f"Token tying: mode={config.experiment.token_tying_mode}, "
+            f"ratio={config.experiment.token_tying_ratio}, "
+            f"tied={n_tied}/{len(tied_token_mask)} tokens, "
+            f"tied_mass={tied_mass_frac:.4f}"
+        )
+
+        # If using permutations, modify them so tied tokens are identity
+        if config.experiment.permute_tokens_per_compartment and use_pretokenized:
+            if master_process and os.path.exists(permutations_path):
+                perms = np.load(permutations_path)
+                perms = apply_tying_to_permutations(perms, tied_token_mask)
+                # Overwrite the permutations file with tying-adjusted version
+                tmp_path = permutations_path + f".tying.tmp.{os.getpid()}"
+                with open(tmp_path, "wb") as f:
+                    np.save(f, perms)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, permutations_path)
+                print0(f"Applied token tying to permutations at {permutations_path}")
+            if ddp:
+                torch.distributed.barrier()
+
     torch.manual_seed(training_seed)
     torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
@@ -1111,6 +1217,7 @@ def main(config: JobConfig) -> None:
                 permutations_path if exp_cfg.permute_tokens_per_compartment else None
             ),
             permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
+            tied_token_mask=tied_token_mask,
         )
         val_loader = None
         if val_bin:
@@ -1131,6 +1238,7 @@ def main(config: JobConfig) -> None:
                     else None
                 ),
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
+                tied_token_mask=tied_token_mask,
             )
     else:
         # Uniform synthetic stream
@@ -1147,6 +1255,9 @@ def main(config: JobConfig) -> None:
                 for c, child_ss in enumerate(child_seeds):
                     gen = np.random.Generator(np.random.PCG64(child_ss))
                     uniform_perms[c] = gen.permutation(base_vocab).astype(np.int64)
+                # Apply tying to in-memory permutations if needed
+                if tied_token_mask is not None:
+                    uniform_perms = apply_tying_to_permutations(uniform_perms, tied_token_mask)
                 print0(
                     f"Generated in-memory permutations with shape {uniform_perms.shape}"
                 )
@@ -1166,6 +1277,7 @@ def main(config: JobConfig) -> None:
                 permute_tokens=exp_cfg.permute_tokens_per_compartment,
                 permutations=uniform_perms,
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
+                tied_token_mask=tied_token_mask,
                 pin_memory=True,
             )
         else:

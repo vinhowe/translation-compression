@@ -97,6 +97,7 @@ class UniformCompartmentDataLoader:
     permute_tokens: bool = True
     permutations: Optional[np.ndarray] = None
     permute_inputs: bool = True
+    tied_token_mask: Optional[np.ndarray] = None
     pin_memory: bool = True
 
     def __post_init__(self) -> None:
@@ -152,6 +153,12 @@ class UniformCompartmentDataLoader:
         )
         self._tok_gen = torch.Generator()
         self._tok_gen.manual_seed(int(self.seed) + int(self.process_rank) + 1_000_000)
+
+        # Store tied token mask as torch tensor for offset-mode tying
+        if self.tied_token_mask is not None:
+            self._tied_mask_torch = torch.from_numpy(self.tied_token_mask).bool()
+        else:
+            self._tied_mask_torch = None
 
         # Store permutations as torch tensor for faster indexing
         if self.permutations is not None:
@@ -291,8 +298,15 @@ class UniformCompartmentDataLoader:
         else:
             # Offset-based (no permutation)
             base = self.base_vocab_size
-            content_src = content + (src_c * base).unsqueeze(1)
-            content_dst = content + (dst_c * base).unsqueeze(1)
+            if self._tied_mask_torch is not None:
+                tied_slice = self._tied_mask_torch[content]  # bool [m, half-1]
+                src_off = torch.where(tied_slice, 0, (src_c * base).unsqueeze(1))
+                dst_off = torch.where(tied_slice, 0, (dst_c * base).unsqueeze(1))
+            else:
+                src_off = (src_c * base).unsqueeze(1)
+                dst_off = (dst_c * base).unsqueeze(1)
+            content_src = content + src_off
+            content_dst = content + dst_off
 
         # Build x for translation rows
         # Layout: [TRANS, src_content..., TRANS, dst_content...]
@@ -350,7 +364,12 @@ class UniformCompartmentDataLoader:
             y_comp[:, -1] = -1
         else:
             base = self.base_vocab_size
-            x_comp = tokens + (src_c * base).unsqueeze(1)
+            if self._tied_mask_torch is not None:
+                tied_slice = self._tied_mask_torch[tokens]  # bool [m, T]
+                src_off = torch.where(tied_slice, 0, (src_c * base).unsqueeze(1))
+            else:
+                src_off = (src_c * base).unsqueeze(1)
+            x_comp = tokens + src_off
             y_comp = torch.empty_like(x_comp)
             y_comp[:, :-1] = x_comp[:, 1:]
             y_comp[:, -1] = -1
