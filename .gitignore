@@ -13,6 +13,9 @@ wheels/
 data/fineweb10B*
 data/random*
 
+# Sweep manifest (user-local, re-read each cycle)
+sweeps/.active
+
 # Training outputs
 out/
 tokenizer/

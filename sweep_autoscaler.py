@@ -4,12 +4,27 @@ Lightweight autoscaler for sweep_runner Slurm jobs.
 Periodically scans sweep progress and submits Slurm jobs to maintain target
 GPU counts across multiple partition profiles (H100, B200, etc.).
 
+Supports multiple concurrent sweeps via --sweep (repeatable) and/or an
+--active-file manifest (re-read each cycle, so sweeps can be added mid-run).
+
 Usage:
+    # Single sweep (backwards compatible):
     python sweep_autoscaler.py \\
         --sweep sweeps/bpe16384-n3-n5.yaml \\
         --profile "dw87long|4|6-00:00:00|--qos=dw87long" \\
-        --profile "cs-b200|2|1-00:00:00|--qos=cs --gres=gpu:b200:8" \\
         --interval 120
+
+    # Multi-sweep via manifest:
+    python sweep_autoscaler.py \\
+        --active-file sweeps/.active \\
+        --profile "dw87long|4|6-00:00:00|--qos=dw87long" \\
+        --interval 120
+
+    # Combined (CLI sweeps + manifest):
+    python sweep_autoscaler.py \\
+        --sweep sweeps/base.yaml \\
+        --active-file sweeps/.active \\
+        --profile "dw87long|4|6-00:00:00|--qos=dw87long"
 
     # Dry run (prints sbatch commands without submitting):
     python sweep_autoscaler.py --sweep ... --profile ... --dry-run --once
@@ -107,6 +122,7 @@ class ConfigCandidate:
     has_checkpoint: bool
     iter_num: int
     max_iters: int
+    sweep_path: str = ""
 
 
 @dataclass
@@ -186,6 +202,7 @@ def scan_sweep_state(
             has_checkpoint=has_ckpt,
             iter_num=iter_num,
             max_iters=max_iters,
+            sweep_path=sweep_path,
         )
         if has_ckpt:
             resumable.append(candidate)
@@ -207,6 +224,95 @@ def scan_sweep_state(
         active_gpus=active_gpus,
         assigned_run_ids=assigned_run_ids,
         unassigned_candidates=resumable + fresh,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-sweep support
+# ---------------------------------------------------------------------------
+
+def read_active_sweeps(active_file: str) -> list[str]:
+    """Read manifest file listing sweep YAML paths (one per line).
+
+    Skips blank lines and lines starting with '#'. Returns empty list if
+    the file is missing (fail-open).
+    """
+    try:
+        with open(active_file) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+    paths = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            paths.append(stripped)
+    return paths
+
+
+def validate_sweep_project(sweep_paths: list[str]) -> str:
+    """Validate all sweeps share the same project and return the project_slug.
+
+    This is a lightweight check (parses YAML headers only, no filesystem scan).
+    """
+    if not sweep_paths:
+        raise ValueError("No sweep paths provided")
+
+    project_slugs = {}
+    for sp in sweep_paths:
+        _, project, _, _ = parse_sweep_yaml(sp)
+        ps = slug(project)
+        project_slugs[sp] = ps
+
+    unique_slugs = set(project_slugs.values())
+    if len(unique_slugs) > 1:
+        details = ", ".join(f"{sp} -> {ps}" for sp, ps in project_slugs.items())
+        raise ValueError(f"All sweeps must share the same project, got: {details}")
+
+    return next(iter(unique_slugs))
+
+
+def scan_all_sweeps(
+    sweep_paths: list[str],
+    heartbeats: list[dict] | None = None,
+    freed_run_ids: set[str] | None = None,
+) -> tuple[str, SweepState]:
+    """Scan multiple sweeps and merge into a single SweepState.
+
+    All sweeps must share the same project (validated here).
+    Candidates are deduplicated by run_id — first sweep wins.
+
+    Returns (project_slug, merged_state).
+    """
+    project_slug = validate_sweep_project(sweep_paths)
+
+    # Scan each sweep and merge
+    total = 0
+    done = 0
+    seen_run_ids: set[str] = set()
+    merged_candidates: list[ConfigCandidate] = []
+    merged_assigned: set[str] = set()
+    active_gpus = 0
+
+    for sp in sweep_paths:
+        state = scan_sweep_state(sp, heartbeats=heartbeats, freed_run_ids=freed_run_ids)
+        total += state.total_configs
+        done += state.done_configs
+        merged_assigned |= state.assigned_run_ids
+        active_gpus = state.active_gpus  # same heartbeats, same count
+
+        for candidate in state.unassigned_candidates:
+            if candidate.run_id not in seen_run_ids:
+                seen_run_ids.add(candidate.run_id)
+                merged_candidates.append(candidate)
+
+    return project_slug, SweepState(
+        total_configs=total,
+        done_configs=done,
+        remaining=total - done,
+        active_gpus=active_gpus,
+        assigned_run_ids=merged_assigned,
+        unassigned_candidates=merged_candidates,
     )
 
 
@@ -502,7 +608,6 @@ def reschedule_for_better_gpus(
 
 
 def assign_work_to_idle_workers(
-    sweep_path: str,
     project_slug: str,
     heartbeats: list[dict],
     sweep_state: SweepState,
@@ -548,7 +653,7 @@ def assign_work_to_idle_workers(
             "base_toml": candidate.base_toml,
             "overrides": candidate.overrides,
             "assigned_at": time.time(),
-            "sweep_path": sweep_path,
+            "sweep_path": candidate.sweep_path,
         }
         write_assignment(project_slug, wid, assignment)
         log(f"  Assigned {candidate.run_id} -> {wid}")
@@ -739,7 +844,7 @@ def _cancel_pending_jobs(
 # ---------------------------------------------------------------------------
 
 def cycle(
-    sweep_path: str,
+    sweep_paths: list[str],
     profiles: list[PartitionProfile],
     proxykit_dir: str,
     dry_run: bool,
@@ -747,10 +852,10 @@ def cycle(
     min_remaining_time: int = MIN_REMAINING_TIME_SECS,
 ):
     """One scan-decide-submit cycle."""
-    log("=== Scan cycle ===")
+    log(f"=== Scan cycle ({len(sweep_paths)} active sweep(s)) ===")
 
-    base_toml, project, group, parameters = parse_sweep_yaml(sweep_path)
-    project_slug = slug(project)
+    # Derive project_slug from all sweeps (validated to be the same)
+    project_slug = validate_sweep_project(sweep_paths)
 
     # 1a. Read heartbeats
     heartbeats = read_heartbeats(project_slug)
@@ -770,9 +875,10 @@ def cycle(
         if n_preempted:
             log(f"  Triggered {n_preempted} GPU migration(s)")
 
-    # 1d. Scan sweep state (includes assignment awareness)
-    sweep_state = scan_sweep_state(sweep_path, heartbeats=heartbeats,
-                                   freed_run_ids=set(freed))
+    # 1d. Scan all sweeps and merge state
+    project_slug, sweep_state = scan_all_sweeps(
+        sweep_paths, heartbeats=heartbeats, freed_run_ids=set(freed),
+    )
     n_assigned = len(sweep_state.assigned_run_ids)
     n_assignable = len(sweep_state.unassigned_candidates)
     log(f"Grid: {sweep_state.total_configs} total, "
@@ -783,7 +889,7 @@ def cycle(
         f"{sweep_state.active_gpus} active GPUs (heartbeats)")
 
     # 1e. Assign work to idle workers
-    assign_work_to_idle_workers(sweep_path, project_slug, heartbeats, sweep_state)
+    assign_work_to_idle_workers(project_slug, heartbeats, sweep_state)
 
     # 2. Query squeue
     jobs = get_sweep_jobs()
@@ -810,12 +916,13 @@ def cycle(
     # 3. Decide
     submissions = decide_submissions(sweep_state, profiles, jobs_per_profile)
 
-    # 4. Submit
+    # 4. Submit (use first sweep for sbatch — worker only needs project_slug)
     any_submitted = False
+    submit_sweep = sweep_paths[0]
     for profile in profiles:
         n = submissions.get(profile.name, 0)
         for _ in range(n):
-            job_id = submit_job(profile, sweep_path, proxykit_dir, dry_run)
+            job_id = submit_job(profile, submit_sweep, proxykit_dir, dry_run)
             if job_id:
                 log(f"  Submitted job {job_id} for {profile.name}")
                 any_submitted = True
@@ -839,8 +946,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Autoscaler: maintain target GPU count by submitting Slurm jobs"
     )
-    parser.add_argument("--sweep", required=True,
-                        help="Path to sweep YAML")
+    parser.add_argument("--sweep", action="append", dest="sweeps", default=None,
+                        help="Path to sweep YAML (repeatable)")
+    parser.add_argument("--active-file", default=None,
+                        help="Path to manifest file listing sweep YAMLs (e.g. sweeps/.active)")
     parser.add_argument("--profile", action="append", dest="profiles", required=True,
                         metavar="NAME|MAX_JOBS|TIME|SBATCH_FLAGS",
                         help="Partition profile (repeatable). Example: 'dw87long|4|6-00:00:00|--qos=dw87long'")
@@ -860,6 +969,9 @@ def main():
                         help=f"Min remaining Slurm time (seconds) on target job for rescheduling (default: {MIN_REMAINING_TIME_SECS})")
     args = parser.parse_args()
 
+    if not args.sweeps and not args.active_file:
+        parser.error("At least one of --sweep or --active-file is required")
+
     # Parse profiles
     profiles = []
     seen_names: set[str] = set()
@@ -876,16 +988,30 @@ def main():
         print(f"ERROR: PROXYKIT_DIR not found: {proxykit_dir}", file=sys.stderr)
         sys.exit(1)
 
-    log(f"Sweep: {args.sweep}")
+    cli_sweeps = args.sweeps or []
+    if cli_sweeps:
+        log(f"CLI sweeps: {', '.join(cli_sweeps)}")
+    if args.active_file:
+        log(f"Active file: {args.active_file}")
     log(f"Profiles: {', '.join(f'{p.name} (max {p.max_jobs})' for p in profiles)}")
     log(f"Interval: {args.interval}s | Dry run: {args.dry_run} | Reschedule: {args.reschedule}")
     log("")
 
     while True:
         try:
-            cycle(args.sweep, profiles, proxykit_dir, args.dry_run,
-                  reschedule=args.reschedule,
-                  min_remaining_time=args.min_remaining_time)
+            # Build sweep list each cycle (active file is re-read)
+            sweep_paths = list(cli_sweeps)
+            if args.active_file:
+                from_file = read_active_sweeps(args.active_file)
+                sweep_paths.extend(p for p in from_file if p not in sweep_paths)
+
+            if not sweep_paths:
+                log("WARNING: No sweep paths found (--sweep and active file both empty). Skipping cycle.")
+            else:
+                log(f"{len(sweep_paths)} active sweep(s): {', '.join(sweep_paths)}")
+                cycle(sweep_paths, profiles, proxykit_dir, args.dry_run,
+                      reschedule=args.reschedule,
+                      min_remaining_time=args.min_remaining_time)
         except KeyboardInterrupt:
             log("Interrupted. Exiting.")
             break
