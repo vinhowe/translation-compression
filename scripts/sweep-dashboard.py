@@ -461,7 +461,7 @@ def bar(pct: float, w: int = 12) -> Text:
     return t
 
 
-GPU_STYLES = {"H100": "dark_orange", "H200": "medium_purple1", "B200": "bright_green"}
+GPU_STYLES = {"H100": "dark_orange", "H200": "medium_purple1", "B200": "bold bright_green"}
 
 
 def read_heartbeats(project: str) -> list[dict]:
@@ -726,7 +726,7 @@ def build(sweep_name, configs, rid_to_job, eta_tracker, n_jobs_run, n_jobs_pend,
                 if node:
                     cell.append(f" {node}", style="dim")
                 if gpu:
-                    gpu_style = {"H100": "dark_orange", "H200": "medium_purple1", "B200": "bright_green"}.get(gpu, "dim cyan")
+                    gpu_style = {"H100": "dark_orange", "H200": "medium_purple1", "B200": "bold bright_green"}.get(gpu, "dim cyan")
                     cell.append(f" {gpu}", style=gpu_style)
 
             # ETA
