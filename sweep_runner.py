@@ -19,6 +19,7 @@ import itertools
 import json
 import os
 import random
+import signal
 import socket
 import subprocess
 import sys
@@ -182,6 +183,64 @@ class WorkerHeartbeat:
             os.remove(self._path)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Preemption monitor (GPU rescheduling)
+# ---------------------------------------------------------------------------
+
+class PreemptionMonitor:
+    """Background thread that polls for preemption signal files from the autoscaler.
+
+    The autoscaler writes .preempt/{worker_id_safe}.json when it wants to
+    migrate a run to a better GPU.  When detected, this monitor sends SIGUSR1
+    to our own process (triggering the handler in train.py) and deletes the
+    signal file.
+    """
+
+    POLL_INTERVAL = 5  # seconds
+
+    def __init__(self, project_slug: str, worker_id: str):
+        self._project_slug = project_slug
+        self._worker_id = worker_id
+        safe = _worker_id_to_filename(worker_id)
+        self._signal_path = os.path.join(
+            STORAGE_ROOT, "out", project_slug, ".preempt", f"{safe}.json"
+        )
+        self.was_preempted = False
+        self._reason: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.wait(self.POLL_INTERVAL):
+            if not os.path.exists(self._signal_path):
+                continue
+            try:
+                with open(self._signal_path) as f:
+                    data = json.load(f)
+                self._reason = data.get("reason", "gpu_upgrade")
+                print(f"[preempt-monitor] Preemption signal detected: {self._reason}")
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"[preempt-monitor] Error reading signal file: {e}")
+                self._reason = "gpu_upgrade"
+            # Delete the signal file before sending the signal
+            try:
+                os.remove(self._signal_path)
+            except OSError:
+                pass
+            self.was_preempted = True
+            os.kill(os.getpid(), signal.SIGUSR1)
+            break  # stop polling after preemption
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    @property
+    def reason(self) -> str | None:
+        return self._reason
 
 
 def check_git_is_current() -> tuple[bool, str]:
@@ -490,7 +549,7 @@ def run_training(
         os.environ.pop("OUT_DIR", None)
 
 
-def _override_summary(overrides: dict) -> str:
+def override_summary(overrides: dict) -> str:
     """Short string summarizing the override values."""
     parts = []
     for k, v in overrides.items():
@@ -703,7 +762,7 @@ def main_loop(args):
                 if not try_claim(lock_dir, rid + ".resume", args.cluster):
                     print(f"[sweep] {rid} resume already claimed, trying next...")
                     continue
-                config_label = _override_summary(c["overrides"])
+                config_label = override_summary(c["overrides"])
                 print(
                     f"[sweep] Resuming {rid} (iter {c['iter_num']}) "
                     f"[{config_label}]"
@@ -737,7 +796,7 @@ def main_loop(args):
                 break
 
             if try_claim(lock_dir, rid, args.cluster):
-                config_label = _override_summary(c["overrides"])
+                config_label = override_summary(c["overrides"])
                 print(
                     f"[sweep] Claimed {rid} [{config_label}]"
                 )
@@ -775,6 +834,116 @@ def main_loop(args):
             print("[sweep] Training complete. Scanning for next config...")
         else:
             print("[sweep] Training failed. Scanning for next config...")
+
+
+# ---------------------------------------------------------------------------
+# Poll-based worker mode (centralized assignment from autoscaler)
+# ---------------------------------------------------------------------------
+
+def _worker_id_to_filename(worker_id: str) -> str:
+    """Convert worker_id to a safe filename (replace ':' with '_')."""
+    return worker_id.replace(":", "_")
+
+
+def _read_assignment(path: str) -> dict | None:
+    """Read an assignment JSON file. Returns None if missing or malformed."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _delete_assignment(path: str):
+    """Delete an assignment file (signals completion to autoscaler)."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def poll_loop(args):
+    """Poll-based main loop: wait for autoscaler to assign work via .assignments/ files."""
+    base_toml, project, group, parameters = parse_sweep_yaml(args.sweep)
+    project_slug = slug(project)
+
+    # Start heartbeat
+    heartbeat_dir = os.path.join(STORAGE_ROOT, "out", project_slug, ".heartbeats")
+    heartbeat = WorkerHeartbeat(heartbeat_dir)
+    wid = heartbeat.worker_id
+
+    assignment_dir = os.path.join(STORAGE_ROOT, "out", project_slug, ".assignments")
+    os.makedirs(assignment_dir, exist_ok=True)
+    assignment_path = os.path.join(assignment_dir, f"{_worker_id_to_filename(wid)}.json")
+
+    print(f"[sweep-poll] Worker {wid} polling {assignment_path}")
+
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 5
+    POLL_INTERVAL = 10  # seconds
+
+    heartbeat.set_idle()
+
+    while True:
+        # Check for assignment file
+        assignment = _read_assignment(assignment_path)
+
+        if assignment is None:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        # Check for shutdown signal
+        if assignment.get("action") == "shutdown":
+            print(f"[sweep-poll] Received shutdown signal. Exiting.")
+            _delete_assignment(assignment_path)
+            heartbeat.set_idle()
+            break
+
+        # We have a training assignment
+        run_id = assignment["run_id"]
+        config_label = assignment.get("config_label", run_id)
+        out_dir = assignment["out_dir"]
+        overrides = assignment["overrides"]
+
+        config = build_config(assignment.get("base_toml", base_toml), overrides)
+        max_iters = int(config.training.max_iters)
+
+        print(f"[sweep-poll] Assigned {run_id} [{config_label}]")
+        heartbeat.set_training(run_id, config_label, out_dir, max_iters)
+
+        # Start preemption monitor (watches for .preempt/ signal files)
+        monitor = PreemptionMonitor(project_slug, wid)
+
+        try:
+            run_training(config, run_id, out_dir, args.cluster, args.wandb_buffer)
+            consecutive_failures = 0
+            if monitor.was_preempted:
+                print(f"[sweep-poll] Preempted {run_id} for GPU upgrade — deleting assignment, going idle")
+            else:
+                print(f"[sweep-poll] Training complete for {run_id}")
+        except Exception as e:
+            if monitor.was_preempted:
+                print(f"[sweep-poll] Preempted {run_id} for GPU upgrade (exited with error: {e})")
+            else:
+                print(f"[sweep-poll] Training failed for {run_id}: {e}")
+                heartbeat.set_error(str(e))
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print(f"[sweep-poll] {MAX_CONSECUTIVE_FAILURES} consecutive failures. Exiting.")
+                    _delete_assignment(assignment_path)
+                    monitor.stop()
+                    sys.exit(1)
+                backoff = min(60 * (2 ** (consecutive_failures - 1)), 600)
+                print(f"[sweep-poll] Backing off {backoff}s after {consecutive_failures} "
+                      f"consecutive failure(s)")
+                time.sleep(backoff)
+        finally:
+            monitor.stop()
+
+        # Delete assignment and go idle
+        _delete_assignment(assignment_path)
+        heartbeat.set_idle()
+        print(f"[sweep-poll] Idle, waiting for next assignment...")
 
 
 def print_status(args):
@@ -882,6 +1051,8 @@ def main():
                         help="Show status table and exit")
     parser.add_argument("--allow-behind", action="store_true",
                         help="Allow running even if local branch is behind remote")
+    parser.add_argument("--mode", choices=["lock", "poll"], default="lock",
+                        help="Coordination mode: 'lock' (legacy file locks) or 'poll' (autoscaler assigns work)")
     args = parser.parse_args()
 
     if not args.status and not args.allow_behind:
@@ -894,6 +1065,8 @@ def main():
 
     if args.status:
         print_status(args)
+    elif args.mode == "poll":
+        poll_loop(args)
     else:
         main_loop(args)
 

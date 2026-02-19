@@ -20,6 +20,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 
 import json
 import os
+import signal
 import shutil
 import time
 import uuid
@@ -44,6 +45,16 @@ from src.weights import compute_weights_map
 import struct
 import threading
 from queue import Queue
+
+# ---------------------------------------------------------------------------
+# Graceful preemption via SIGUSR1
+# ---------------------------------------------------------------------------
+_preempt_requested = threading.Event()
+
+
+def _handle_preempt_signal(signum, frame):
+    """SIGUSR1 handler: set flag so the training loop can exit cleanly."""
+    _preempt_requested.set()
 
 
 def check_duplicate_run(
@@ -599,6 +610,10 @@ def _save_rolling_checkpoint(out_dir, raw_model, optimizer, train_loader,
 
 
 def main(config: JobConfig) -> None:
+    # Register SIGUSR1 handler for graceful preemption (GPU rescheduling)
+    signal.signal(signal.SIGUSR1, _handle_preempt_signal)
+    _preempt_requested.clear()
+
     # Apply size tier overrides (if provided) and mirror assignment_seed to training.seed
     config = apply_size_tier(config)
     # Auto-configure batch/grad_accum for bpe16384 vocab if not explicitly set
@@ -1373,6 +1388,24 @@ def main(config: JobConfig) -> None:
     )  # unwrap DDP container if needed
     running_mfu = -1.0
     while True:
+        # Check for preemption signal (GPU rescheduling)
+        if _preempt_requested.is_set():
+            if master_process:
+                print(f"[preempt] SIGUSR1 received at iter {iter_num} — saving checkpoint and exiting")
+                _save_rolling_checkpoint(
+                    out_dir, raw_model, optimizer, train_loader,
+                    val_loader, iter_num, best_val_loss,
+                )
+                if wandb_log and wandb_buffer_enabled:
+                    wandb_flush_buffer()
+                if wandb_log:
+                    try:
+                        import wandb
+                        wandb.mark_preempting()
+                    except Exception:
+                        pass
+            break
+
         # determine and set the learning rate for this iteration
         # lr = get_lr(iter_num) if decay_lr else learning_rate
         lr = get_lr(iter_num)
