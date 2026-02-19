@@ -186,6 +186,13 @@ class Experiment:
     translation_mode: Literal["standard", "interleaved"] = "standard"
     # Chunk size for interleaved translation mode (n-gram size)
     translation_chunk_size: int = 4
+    # DANN (Domain-Adversarial Neural Network) settings
+    # Adversarial strength. 0 = disabled.
+    dann_lambda: float = 0.0
+    # Comma-separated layer indices for DANN, e.g. "2,4,6". Empty = disabled.
+    dann_layers: str = ""
+    # Discriminator hidden size. 0 = use n_embd.
+    dann_disc_hidden: int = 0
 
 
 @dataclass(frozen=True)

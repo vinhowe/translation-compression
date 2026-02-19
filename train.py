@@ -37,6 +37,7 @@ from src.config.job_config import JobConfig, Model
 from src.config.manager import ConfigManager
 from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, slug, write_meta
 from src.model import GPT
+from src.dann import DANNModule, parse_dann_layers
 from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
 from src.config.presets import apply_size_tier, apply_bpe16384_batch_config
@@ -1072,6 +1073,33 @@ def main(config: JobConfig) -> None:
         model.crop_block_size(block_size)
     model.to(device)
 
+    # --- DANN setup ---
+    dann_layer_indices = parse_dann_layers(config.experiment.dann_layers, gptconf.n_layer)
+    dann_lambda = config.experiment.dann_lambda
+    dann_enabled = len(dann_layer_indices) > 0 and dann_lambda > 0
+    dann_module: DANNModule | None = None
+    if dann_enabled:
+        # Set layer collection attribute on model before compile
+        cast(GPT, model)._dann_collect_layers = frozenset(dann_layer_indices)
+        dann_disc_hidden = config.experiment.dann_disc_hidden
+        dann_module = DANNModule(
+            layer_indices=dann_layer_indices,
+            n_embd=gptconf.n_embd,
+            n_domains=exp_cfg.n_compartments,
+            hidden=dann_disc_hidden,
+        )
+        # Load DANN state if resuming
+        dann_ckpt_path = os.path.join(ckpt_dir, "dann_discriminators.pt") if (
+            os.path.islink(ckpt_dir) or os.path.isdir(ckpt_dir)
+        ) else None
+        if dann_ckpt_path and os.path.exists(dann_ckpt_path):
+            dann_state = torch.load(dann_ckpt_path, map_location=device)
+            dann_module.load_state_dict(dann_state)
+            print0(f"Loaded DANN discriminator state from {dann_ckpt_path}")
+        dann_module.to(device)
+        print0(f"DANN enabled: lambda={dann_lambda}, layers={dann_layer_indices}, "
+               f"n_domains={exp_cfg.n_compartments}, hidden={dann_disc_hidden or gptconf.n_embd}")
+
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = torch.GradScaler(enabled=(dtype == "float16"))
 
@@ -1079,6 +1107,9 @@ def main(config: JobConfig) -> None:
     optimizer = model.configure_optimizers(
         weight_decay, learning_rate, (beta1, beta2), device_type
     )
+    # Add DANN discriminator params to optimizer (no weight decay)
+    if dann_enabled and dann_module is not None:
+        optimizer.add_param_group({"params": dann_module.parameters(), "weight_decay": 0.0})
     if checkpoint is not None and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])  # pyright: ignore[reportArgumentType]
     checkpoint = None  # free up memory
@@ -1092,6 +1123,8 @@ def main(config: JobConfig) -> None:
     # wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])  # pyright: ignore[reportPossiblyUnboundVariable]
+        if dann_enabled and dann_module is not None:
+            dann_module = DDP(dann_module, device_ids=[ddp_local_rank])
 
     # Data loaders: pretokenized assignments-based vs uniform synthetic
     if use_pretokenized:
@@ -1216,7 +1249,8 @@ def main(config: JobConfig) -> None:
                 with ctx:
                     # mark cudagraph step begin if available to avoid output overwrite
                     torch.compiler.cudagraph_mark_step_begin()
-                    logits, loss = model(X, Y, compartment_ids=Cval)
+                    result = model(X, Y, compartment_ids=Cval)
+                    loss = result[1]  # works for both 2-tuple and 3-tuple
                 losses[k] = loss.item()
             out[split] = losses.mean()
         model.train()
@@ -1349,6 +1383,10 @@ def main(config: JobConfig) -> None:
             # so a SIGKILL can't leave latest pointing at an incomplete checkpoint.
             torch.save(raw_model.state_dict(), os.path.join(step_dir, "model.pt"))
             torch.save(optimizer.state_dict(), os.path.join(step_dir, "optimizer.pt"))
+            # Save DANN discriminator state
+            if dann_enabled and dann_module is not None:
+                raw_dann = dann_module.module if isinstance(dann_module, DDP) else dann_module
+                torch.save(raw_dann.state_dict(), os.path.join(step_dir, "dann_discriminators.pt"))
             # Save dataloader state for resumption
             dl_state = {"train": train_loader.state_dict()}
             if val_loader is not None:
@@ -1391,21 +1429,31 @@ def main(config: JobConfig) -> None:
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
         last_loss: Optional[torch.Tensor] = None
+        last_dann_loss: Optional[float] = None
         for micro_step in range(gradient_accumulation_steps):
             if ddp:
                 # in DDP training we only need to sync gradients at the last micro step.
                 # the official way to do this is with model.no_sync() context manager, but
                 # I really dislike that this bloats the code and forces us to repeat code
                 # looking at the source of that context manager, it just toggles this variable
-                cast(DDP, model).require_backward_grad_sync = (
-                    micro_step == gradient_accumulation_steps - 1
-                )
+                is_last_micro = micro_step == gradient_accumulation_steps - 1
+                cast(DDP, model).require_backward_grad_sync = is_last_micro
+                if dann_enabled and dann_module is not None and isinstance(dann_module, DDP):
+                    cast(DDP, dann_module).require_backward_grad_sync = is_last_micro
             with ctx:
                 torch.compiler.cudagraph_mark_step_begin()
-                logits, loss = model(X, Y, compartment_ids=C)
-                loss = (
-                    loss / gradient_accumulation_steps
-                )  # scale the loss to account for gradient accumulation
+                if dann_enabled:
+                    logits, lm_loss, layer_outputs = model(X, Y, compartment_ids=C)
+                else:
+                    logits, lm_loss = model(X, Y, compartment_ids=C)
+                lm_loss = lm_loss / gradient_accumulation_steps
+                if dann_enabled and C is not None and dann_module is not None:
+                    domain_labels = C[:, 0]  # per-sequence compartment
+                    dann_loss = dann_module(layer_outputs, domain_labels, dann_lambda)
+                    last_dann_loss = dann_loss.item()
+                    loss = lm_loss + dann_loss / gradient_accumulation_steps
+                else:
+                    loss = lm_loss
             last_loss = loss
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             batch = train_loader.next_batch()
@@ -1421,7 +1469,10 @@ def main(config: JobConfig) -> None:
         # clip the gradient
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            all_params = list(model.parameters())
+            if dann_enabled and dann_module is not None:
+                all_params += list(dann_module.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
         # step the optimizer and scaler if training in fp16
         scaler.step(optimizer)
         scaler.update()
@@ -1447,16 +1498,16 @@ def main(config: JobConfig) -> None:
                 f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%"
             )
             if wandb_log and master_process:
-                wandb_log_or_buffer(
-                    {
-                        "iter": iter_num,
-                        "train/loss": lossf,
-                        "lr": lr,
-                        "mfu": running_mfu * 100,
-                        "time_ms": dt * 1000,
-                    },
-                    step=iter_num,
-                )
+                log_metrics: dict[str, Any] = {
+                    "iter": iter_num,
+                    "train/loss": lossf,
+                    "lr": lr,
+                    "mfu": running_mfu * 100,
+                    "time_ms": dt * 1000,
+                }
+                if dann_enabled and last_dann_loss is not None:
+                    log_metrics["train/dann_loss"] = last_dann_loss
+                wandb_log_or_buffer(log_metrics, step=iter_num)
         iter_num += 1
         local_iter_num += 1
 

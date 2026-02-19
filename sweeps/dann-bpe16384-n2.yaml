@@ -1,0 +1,24 @@
+method: grid
+name: dann-bpe16384-n2
+project: translation-compression
+program: train.py
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --job.config-file
+  - ./config/sweep-base-bpe16384-absolute.toml
+  - ${args}
+parameters:
+  model.size_tier:
+    values: ["8-32", "8-64", "8-128", "8-256"]
+  experiment.n_compartments:
+    values: [2]
+  experiment.translation_ratio:
+    values: [0]
+  experiment.dann_lambda:
+    values: [0.01, 0.1, 0.5, 1.0]
+  experiment.dann_layers:
+    values: ["1,3,5,7", "3,7", "7"]
+  training.seed:
+    values: [64]
