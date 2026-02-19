@@ -145,6 +145,14 @@ class ConfigManager:
                 "experiment.n_compartments must be <= experiment.max_compartments"
             )
 
+        # Token tying validation
+        if not (0.0 <= exp.token_tying_ratio <= 1.0):
+            raise ValueError("experiment.token_tying_ratio must be in [0, 1]")
+        if exp.token_tying_mode != "none" and exp.n_compartments < 2:
+            raise ValueError(
+                "experiment.n_compartments must be >= 2 when token_tying_mode is enabled"
+            )
+
         # Validate advanced options: shared_token_embeddings vs weight tying
         if exp.shared_token_embeddings and self.config.model.weight_tying:
             raise ValueError(

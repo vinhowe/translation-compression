@@ -38,8 +38,10 @@ from src.config.job_config import JobConfig, Model
 from src.config.manager import ConfigManager
 from src.experiment import append_to_experiment_log, cfg_hash, run_dirs, slug, write_meta
 from src.model import GPT
+from src.dann import DANNModule, parse_dann_layers
 from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
+from src.token_tying import compute_token_frequencies, compute_tied_mask, apply_tying_to_permutations, build_tying_remap
 from src.config.presets import apply_size_tier, apply_bpe16384_batch_config
 from src.weights import compute_weights_map
 import struct
@@ -257,6 +259,9 @@ class AssignmentsDataLoader:
         permutations_path: Optional[str] = None,
         permute_inputs: bool = True,
         pin_memory: bool = True,
+        tied_token_mask: Optional[np.ndarray] = None,
+        tying_remap: Optional[np.ndarray] = None,
+        translation_token_id: Optional[int] = None,
     ) -> None:
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -267,8 +272,10 @@ class AssignmentsDataLoader:
         self.n_compartments = n_compartments
         self.permute_tokens = permute_tokens
         self.permute_inputs = permute_inputs
+        self._tied_token_mask = tied_token_mask  # bool[base_vocab_size] or None
+        self._tying_remap = tying_remap  # int64[n_compartments, base_vocab] or None
         # translation token id differs by mode; uses n_compartments to match model vocab size
-        self.translation_token_id = (
+        self.translation_token_id = translation_token_id if translation_token_id is not None else (
             base_vocab_size if permute_tokens else base_vocab_size * n_compartments
         )
         # Optionally load permutations array of shape [max_compartments, base_vocab]
@@ -489,11 +496,20 @@ class AssignmentsDataLoader:
                 seq_out[:, 1:half] = perm_src
                 seq_out[:, half + 1 :] = perm_dst
             else:
-                base = self.base_vocab_size
-                src_offsets = srcs[idx_trans] * base
-                dst_offsets = dsts[idx_trans] * base
-                seq_in[:, 1:half] = samples[:, : half - 1] + src_offsets[:, None]
-                seq_in[:, half + 1 :] = samples[:, : half - 1] + dst_offsets[:, None]
+                token_slice = samples[:, : half - 1]
+                if self._tying_remap is not None:
+                    # Compact remap: remap[comp, base_token] -> compact_id
+                    remap = self._tying_remap
+                    src_comp = srcs[idx_trans]
+                    dst_comp = dsts[idx_trans]
+                    seq_in[:, 1:half] = remap[src_comp[:, None], token_slice]
+                    seq_in[:, half + 1 :] = remap[dst_comp[:, None], token_slice]
+                else:
+                    base = self.base_vocab_size
+                    src_off = srcs[idx_trans][:, None] * base
+                    dst_off = dsts[idx_trans][:, None] * base
+                    seq_in[:, 1:half] = token_slice + src_off
+                    seq_in[:, half + 1 :] = token_slice + dst_off
                 # Without permutation, inputs and outputs are identical
                 seq_out[:, 1:half] = seq_in[:, 1:half]
                 seq_out[:, half + 1 :] = seq_in[:, half + 1 :]
@@ -533,9 +549,14 @@ class AssignmentsDataLoader:
                 y_comp[:, :-1] = perm_samples[:, 1:]
                 y_comp[:, -1] = -1
             else:
-                base = self.base_vocab_size
-                src_offsets = srcs[idx_comp] * base
-                x_comp = samples + src_offsets[:, None]
+                if self._tying_remap is not None:
+                    remap = self._tying_remap
+                    src_comp = srcs[idx_comp]
+                    x_comp = remap[src_comp[:, None], samples]
+                else:
+                    base = self.base_vocab_size
+                    src_off = srcs[idx_comp][:, None] * base
+                    x_comp = samples + src_off
                 y_comp = np.empty_like(x_comp)
                 y_comp[:, :-1] = x_comp[:, 1:]
                 y_comp[:, -1] = -1
@@ -931,6 +952,110 @@ def main(config: JobConfig) -> None:
     # Ensure all processes wait for assignments/permutations if using pretokenized data
     if ddp and use_pretokenized:
         torch.distributed.barrier()
+
+    # --- Token tying: compute frequency cache and tied mask ---
+    tied_token_mask: Optional[np.ndarray] = None
+    if config.experiment.token_tying_mode != "none" and use_pretokenized:
+        import hashlib
+
+        _tying_vocab = config.model.vocab_size
+        if _tying_vocab is None:
+            raise ValueError("model.vocab_size must be set for token tying")
+
+        freq_shards = config.experiment.token_tying_freq_shards
+        data_hash = hashlib.sha256(train_bin.encode()).hexdigest()[:12]
+        freq_cache_name = f"token_freqs_v{_tying_vocab}_d{data_hash}_s{freq_shards}.npy"
+        freq_cache_dir = os.path.join(STORAGE_ROOT, "cache")
+        freq_cache_path = os.path.join(freq_cache_dir, freq_cache_name)
+
+        # Compute/load frequency cache (lock-based write-once, master only writes)
+        if master_process:
+            os.makedirs(freq_cache_dir, exist_ok=True)
+            if not os.path.exists(freq_cache_path):
+                lock_path = freq_cache_path + ".lock"
+                tmp_path = freq_cache_path + f".tmp.{os.getpid()}"
+                acquired = False
+                while True:
+                    try:
+                        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                        os.close(fd)
+                        acquired = True
+                        break
+                    except FileExistsError:
+                        if os.path.exists(freq_cache_path):
+                            break
+                        time.sleep(0.1)
+                if acquired:
+                    try:
+                        freqs = compute_token_frequencies(
+                            train_bin, _tying_vocab, max_shards=freq_shards
+                        )
+                        with open(tmp_path, "wb") as f:
+                            np.save(f, freqs)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp_path, freq_cache_path)
+                        print0(f"Wrote token frequency cache to {freq_cache_path}")
+                    finally:
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        try:
+                            os.remove(lock_path)
+                        except Exception:
+                            pass
+                else:
+                    print0(f"Using cached token frequencies at {freq_cache_path}")
+            else:
+                print0(f"Using cached token frequencies at {freq_cache_path}")
+
+        if ddp:
+            torch.distributed.barrier()
+
+        # All processes load the frequency cache and compute the tied mask
+        freqs = np.load(freq_cache_path)
+        tied_token_mask = compute_tied_mask(
+            freqs, config.experiment.token_tying_mode, config.experiment.token_tying_ratio
+        )
+        n_tied = int(tied_token_mask.sum())
+        tied_mass_frac = float(freqs[tied_token_mask].sum()) / max(1, float(freqs.sum()))
+        print0(
+            f"Token tying: mode={config.experiment.token_tying_mode}, "
+            f"ratio={config.experiment.token_tying_ratio}, "
+            f"tied={n_tied}/{len(tied_token_mask)} tokens, "
+            f"tied_mass={tied_mass_frac:.4f}"
+        )
+
+        # If using permutations, modify them so tied tokens are identity
+        if config.experiment.permute_tokens_per_compartment and use_pretokenized:
+            if master_process and os.path.exists(permutations_path):
+                perms = np.load(permutations_path)
+                perms = apply_tying_to_permutations(perms, tied_token_mask)
+                # Overwrite the permutations file with tying-adjusted version
+                tmp_path = permutations_path + f".tying.tmp.{os.getpid()}"
+                with open(tmp_path, "wb") as f:
+                    np.save(f, perms)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, permutations_path)
+                print0(f"Applied token tying to permutations at {permutations_path}")
+            if ddp:
+                torch.distributed.barrier()
+
+    # Build compact remap table for offset mode tying
+    tying_remap: Optional[np.ndarray] = None
+    tying_compact_vocab: Optional[int] = None
+    if tied_token_mask is not None and not config.experiment.permute_tokens_per_compartment:
+        tying_remap, tying_compact_vocab = build_tying_remap(
+            tied_token_mask, config.experiment.n_compartments
+        )
+        print0(
+            f"Compact vocab: {tying_compact_vocab + 1} "
+            f"(vs {config.model.vocab_size * config.experiment.n_compartments + 1} without tying)"
+        )
+
     torch.manual_seed(training_seed)
     torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
@@ -967,18 +1092,21 @@ def main(config: JobConfig) -> None:
         )
     # If permuting per compartment, vocabulary is base_vocab + 1 (only translation token)
     # Otherwise, it's base_vocab * n_compartments + 1 (offset scheme)
+    # With token tying compact layout, vocab shrinks to base_vocab + (n_comp-1)*n_untied + 1
     # Note: we use n_compartments (not max_compartments) to size the model efficiently
-    composite_vocab = (
-        base_vocab + 1
-        if exp_cfg.permute_tokens_per_compartment
-        else base_vocab * exp_cfg.n_compartments + 1
-    )
-    # Translation token id differs by mode
-    translation_token_id_cfg = (
-        base_vocab
-        if exp_cfg.permute_tokens_per_compartment
-        else base_vocab * exp_cfg.n_compartments
-    )
+    if tying_compact_vocab is not None:
+        composite_vocab = tying_compact_vocab + 1  # +1 for translation token
+    elif exp_cfg.permute_tokens_per_compartment:
+        composite_vocab = base_vocab + 1
+    else:
+        composite_vocab = base_vocab * exp_cfg.n_compartments + 1
+    # Translation token id is always the last id in the vocab
+    if tying_compact_vocab is not None:
+        translation_token_id_cfg = tying_compact_vocab
+    elif exp_cfg.permute_tokens_per_compartment:
+        translation_token_id_cfg = base_vocab
+    else:
+        translation_token_id_cfg = base_vocab * exp_cfg.n_compartments
     # Auto-resume from latest checkpoint if present; else init from scratch
     # Prefer the highest step-* or rolling checkpoint, whichever is newer.
     ckpt_root = os.path.join(out_dir, "checkpoints")
@@ -1155,6 +1283,33 @@ def main(config: JobConfig) -> None:
         model.crop_block_size(block_size)
     model.to(device)
 
+    # --- DANN setup ---
+    dann_layer_indices = parse_dann_layers(config.experiment.dann_layers, gptconf.n_layer)
+    dann_lambda = config.experiment.dann_lambda
+    dann_enabled = len(dann_layer_indices) > 0 and dann_lambda > 0
+    dann_module: DANNModule | None = None
+    if dann_enabled:
+        # Set layer collection attribute on model before compile
+        cast(GPT, model)._dann_collect_layers = frozenset(dann_layer_indices)
+        dann_disc_hidden = config.experiment.dann_disc_hidden
+        dann_module = DANNModule(
+            layer_indices=dann_layer_indices,
+            n_embd=gptconf.n_embd,
+            n_domains=exp_cfg.n_compartments,
+            hidden=dann_disc_hidden,
+        )
+        # Load DANN state if resuming
+        dann_ckpt_path = os.path.join(ckpt_dir, "dann_discriminators.pt") if (
+            os.path.islink(ckpt_dir) or os.path.isdir(ckpt_dir)
+        ) else None
+        if dann_ckpt_path and os.path.exists(dann_ckpt_path):
+            dann_state = torch.load(dann_ckpt_path, map_location=device)
+            dann_module.load_state_dict(dann_state)
+            print0(f"Loaded DANN discriminator state from {dann_ckpt_path}")
+        dann_module.to(device)
+        print0(f"DANN enabled: lambda={dann_lambda}, layers={dann_layer_indices}, "
+               f"n_domains={exp_cfg.n_compartments}, hidden={dann_disc_hidden or gptconf.n_embd}")
+
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = torch.GradScaler(enabled=(dtype == "float16"))
 
@@ -1162,6 +1317,9 @@ def main(config: JobConfig) -> None:
     optimizer = model.configure_optimizers(
         weight_decay, learning_rate, (beta1, beta2), device_type
     )
+    # Add DANN discriminator params to optimizer (no weight decay)
+    if dann_enabled and dann_module is not None:
+        optimizer.add_param_group({"params": dann_module.parameters(), "weight_decay": 0.0})
     if checkpoint is not None and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])  # pyright: ignore[reportArgumentType]
     checkpoint = None  # free up memory
@@ -1175,6 +1333,8 @@ def main(config: JobConfig) -> None:
     # wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])  # pyright: ignore[reportPossiblyUnboundVariable]
+        if dann_enabled and dann_module is not None:
+            dann_module = DDP(dann_module, device_ids=[ddp_local_rank])
 
     # Data loaders: pretokenized assignments-based vs uniform synthetic
     if use_pretokenized:
@@ -1194,6 +1354,9 @@ def main(config: JobConfig) -> None:
                 permutations_path if exp_cfg.permute_tokens_per_compartment else None
             ),
             permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
+            tied_token_mask=tied_token_mask,
+            tying_remap=tying_remap,
+            translation_token_id=translation_token_id_cfg,
         )
         val_loader = None
         if val_bin:
@@ -1214,6 +1377,9 @@ def main(config: JobConfig) -> None:
                     else None
                 ),
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
+                tied_token_mask=tied_token_mask,
+                tying_remap=tying_remap,
+                translation_token_id=translation_token_id_cfg,
             )
     else:
         # Uniform synthetic stream
@@ -1230,6 +1396,9 @@ def main(config: JobConfig) -> None:
                 for c, child_ss in enumerate(child_seeds):
                     gen = np.random.Generator(np.random.PCG64(child_ss))
                     uniform_perms[c] = gen.permutation(base_vocab).astype(np.int64)
+                # Apply tying to in-memory permutations if needed
+                if tied_token_mask is not None:
+                    uniform_perms = apply_tying_to_permutations(uniform_perms, tied_token_mask)
                 print0(
                     f"Generated in-memory permutations with shape {uniform_perms.shape}"
                 )
@@ -1249,7 +1418,12 @@ def main(config: JobConfig) -> None:
                 permute_tokens=exp_cfg.permute_tokens_per_compartment,
                 permutations=uniform_perms,
                 permute_inputs=exp_cfg.permute_input_tokens_per_compartment,
+                tied_token_mask=tied_token_mask,
+                tying_remap=tying_remap,
+                translation_token_id_override=translation_token_id_cfg if tying_remap is not None else None,
                 pin_memory=True,
+                translation_mode=exp_cfg.translation_mode,
+                translation_chunk_size=exp_cfg.translation_chunk_size,
             )
         else:
             # Simple single-compartment uniform data (original behavior)
@@ -1297,7 +1471,8 @@ def main(config: JobConfig) -> None:
                 with ctx:
                     # mark cudagraph step begin if available to avoid output overwrite
                     torch.compiler.cudagraph_mark_step_begin()
-                    logits, loss = model(X, Y, compartment_ids=Cval)
+                    result = model(X, Y, compartment_ids=Cval)
+                    loss = result[1]  # works for both 2-tuple and 3-tuple
                 losses[k] = loss.item()
             out[split] = losses.mean()
         model.train()
@@ -1448,6 +1623,10 @@ def main(config: JobConfig) -> None:
             # so a SIGKILL can't leave latest pointing at an incomplete checkpoint.
             torch.save(raw_model.state_dict(), os.path.join(step_dir, "model.pt"))
             torch.save(optimizer.state_dict(), os.path.join(step_dir, "optimizer.pt"))
+            # Save DANN discriminator state
+            if dann_enabled and dann_module is not None:
+                raw_dann = dann_module.module if isinstance(dann_module, DDP) else dann_module
+                torch.save(raw_dann.state_dict(), os.path.join(step_dir, "dann_discriminators.pt"))
             # Save dataloader state for resumption
             dl_state = {"train": train_loader.state_dict()}
             if val_loader is not None:
@@ -1504,21 +1683,31 @@ def main(config: JobConfig) -> None:
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
         last_loss: Optional[torch.Tensor] = None
+        last_dann_loss: Optional[float] = None
         for micro_step in range(gradient_accumulation_steps):
             if ddp:
                 # in DDP training we only need to sync gradients at the last micro step.
                 # the official way to do this is with model.no_sync() context manager, but
                 # I really dislike that this bloats the code and forces us to repeat code
                 # looking at the source of that context manager, it just toggles this variable
-                cast(DDP, model).require_backward_grad_sync = (
-                    micro_step == gradient_accumulation_steps - 1
-                )
+                is_last_micro = micro_step == gradient_accumulation_steps - 1
+                cast(DDP, model).require_backward_grad_sync = is_last_micro
+                if dann_enabled and dann_module is not None and isinstance(dann_module, DDP):
+                    cast(DDP, dann_module).require_backward_grad_sync = is_last_micro
             with ctx:
                 torch.compiler.cudagraph_mark_step_begin()
-                logits, loss = model(X, Y, compartment_ids=C)
-                loss = (
-                    loss / gradient_accumulation_steps
-                )  # scale the loss to account for gradient accumulation
+                if dann_enabled:
+                    logits, lm_loss, layer_outputs = model(X, Y, compartment_ids=C)
+                else:
+                    logits, lm_loss = model(X, Y, compartment_ids=C)
+                lm_loss = lm_loss / gradient_accumulation_steps
+                if dann_enabled and C is not None and dann_module is not None:
+                    domain_labels = C[:, 0]  # per-sequence compartment
+                    dann_loss = dann_module(layer_outputs, domain_labels, dann_lambda)
+                    last_dann_loss = dann_loss.item()
+                    loss = lm_loss + dann_loss / gradient_accumulation_steps
+                else:
+                    loss = lm_loss
             last_loss = loss
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             batch = train_loader.next_batch()
@@ -1534,7 +1723,10 @@ def main(config: JobConfig) -> None:
         # clip the gradient
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            all_params = list(model.parameters())
+            if dann_enabled and dann_module is not None:
+                all_params += list(dann_module.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
         # step the optimizer and scaler if training in fp16
         scaler.step(optimizer)
         scaler.update()
@@ -1560,16 +1752,16 @@ def main(config: JobConfig) -> None:
                 f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%"
             )
             if wandb_log and master_process:
-                wandb_log_or_buffer(
-                    {
-                        "iter": iter_num,
-                        "train/loss": lossf,
-                        "lr": lr,
-                        "mfu": running_mfu * 100,
-                        "time_ms": dt * 1000,
-                    },
-                    step=iter_num,
-                )
+                log_metrics: dict[str, Any] = {
+                    "iter": iter_num,
+                    "train/loss": lossf,
+                    "lr": lr,
+                    "mfu": running_mfu * 100,
+                    "time_ms": dt * 1000,
+                }
+                if dann_enabled and last_dann_loss is not None:
+                    log_metrics["train/dann_loss"] = last_dann_loss
+                wandb_log_or_buffer(log_metrics, step=iter_num)
         iter_num += 1
         local_iter_num += 1
 

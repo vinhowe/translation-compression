@@ -180,6 +180,26 @@ class Experiment:
     # also permuted. If False, inputs use the unpermuted base tokens while
     # targets remain in the permuted id space.
     permute_input_tokens_per_compartment: FlagConversionOff[bool] = True
+    # Translation sequence format:
+    # - "standard": [TRANS][src tokens][TRANS][dst tokens] (current behavior)
+    # - "interleaved": [TRANS][src chunk][dst chunk][src chunk][dst chunk]...
+    translation_mode: Literal["standard", "interleaved"] = "standard"
+    # Chunk size for interleaved translation mode (n-gram size)
+    translation_chunk_size: int = 4
+    # DANN (Domain-Adversarial Neural Network) settings
+    # Adversarial strength. 0 = disabled.
+    dann_lambda: float = 0.0
+    # Comma-separated layer indices for DANN, e.g. "2,4,6". Empty = disabled.
+    dann_layers: str = ""
+    # Discriminator hidden size. 0 = use n_embd.
+    dann_disc_hidden: int = 0
+    # Token tying: share a subset of tokens across compartments
+    # "none" = no tying, "top_k" = tie most frequent tokens, "bottom_k" = tie least frequent
+    token_tying_mode: Literal["none", "top_k", "bottom_k"] = "none"
+    # Fraction of token mass that is *untied* (needs translation). 0 = all tied, 1 = none tied.
+    token_tying_ratio: float = 0.0
+    # Number of data shards to sample for frequency estimation
+    token_tying_freq_shards: int = 1
 
 
 @dataclass(frozen=True)
