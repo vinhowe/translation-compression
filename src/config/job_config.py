@@ -180,6 +180,13 @@ class Experiment:
     # also permuted. If False, inputs use the unpermuted base tokens while
     # targets remain in the permuted id space.
     permute_input_tokens_per_compartment: FlagConversionOff[bool] = True
+    # DANN (Domain-Adversarial Neural Network) settings
+    # Adversarial strength. 0 = disabled.
+    dann_lambda: float = 0.0
+    # Comma-separated layer indices for DANN, e.g. "2,4,6". Empty = disabled.
+    dann_layers: str = ""
+    # Discriminator hidden size. 0 = use n_embd.
+    dann_disc_hidden: int = 0
 
 
 @dataclass(frozen=True)

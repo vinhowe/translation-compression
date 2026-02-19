@@ -311,6 +311,9 @@ class GPT(nn.Module):
                         head_w[start:end].copy_(base)
                 # else: skip silently per request
 
+        # DANN: set of layer indices to collect outputs from (set from train.py before compile)
+        self._dann_collect_layers: frozenset[int] | None = None
+
         # report number of parameters
         n_params = self.get_num_params()
         if n_params < 1e6:
@@ -389,8 +392,11 @@ class GPT(nn.Module):
             comp_emb = cast(nn.Embedding, self.comp_emb)(compartment_ids)
             x_input = x_input + comp_emb
         x = cast(nn.Dropout, self.transformer.drop)(x_input)
-        for block in cast(nn.ModuleList, self.transformer.h):
+        layer_outputs: dict[int, torch.Tensor] = {}
+        for i, block in enumerate(cast(nn.ModuleList, self.transformer.h)):
             x = block(x, rope_cos=rope_cos, rope_sin=rope_sin)
+            if self._dann_collect_layers is not None and i in self._dann_collect_layers:
+                layer_outputs[i] = x
         x = cast(nn.LayerNorm, self.transformer.ln_f)(x)
 
         # decide how to compute logits
@@ -409,6 +415,8 @@ class GPT(nn.Module):
         else:
             loss = None
 
+        if self._dann_collect_layers is not None:
+            return logits, loss, layer_outputs
         return logits, loss
 
     def crop_block_size(self, block_size):
