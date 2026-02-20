@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import atexit
+import calendar
 import itertools
 import json
 import os
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import asdict, fields, replace
 from typing import Any
 
@@ -396,30 +398,45 @@ def deterministic_out_dir(config: JobConfig, project: str, group: str | None) ->
 
 
 def try_claim(lock_dir: str, run_id: str, cluster: str) -> bool:
-    """Atomic file-lock claim. O_CREAT | O_EXCL on {lock_dir}/{run_id}.lock.
+    """Atomic directory-lock claim. mkdir on {lock_dir}/{run_id}.lock.
 
-    Write cluster name + timestamp to the lock file.
+    mkdir is atomic on NFS (unlike O_CREAT|O_EXCL on a file).
+    Writes metadata to lock_meta.json inside the lock directory.
     Returns True if claimed, False if already taken.
     """
     os.makedirs(lock_dir, exist_ok=True)
     lock_path = os.path.join(lock_dir, f"{run_id}.lock")
     try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        lock_data = {
-            "cluster": cluster,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "pid": os.getpid(),
-        }
-        if cluster == "slurm":
-            slurm_id = _get_slurm_job_id()
-            if slurm_id:
-                lock_data["slurm_job_id"] = slurm_id
-        content = json.dumps(lock_data)
-        os.write(fd, content.encode())
-        os.close(fd)
-        return True
+        os.mkdir(lock_path)  # atomic on NFS — raises FileExistsError
     except FileExistsError:
         return False
+    # Write metadata inside the lock directory
+    lock_data = {
+        "cluster": cluster,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "claim_token": uuid.uuid4().hex,
+    }
+    if cluster == "slurm":
+        slurm_id = _get_slurm_job_id()
+        if slurm_id:
+            lock_data["slurm_job_id"] = slurm_id
+    meta_path = os.path.join(lock_path, "lock_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(lock_data, f)
+    # Post-claim verify: sleep briefly then confirm our token is still there.
+    # Guards against the (extremely unlikely) case of two mkdir calls both
+    # succeeding due to NFS cache inconsistency.
+    time.sleep(1)
+    try:
+        with open(meta_path) as f:
+            stored = json.load(f)
+        if stored.get("claim_token") != lock_data["claim_token"]:
+            return False
+    except (OSError, json.JSONDecodeError):
+        return False
+    return True
 
 
 def _get_slurm_job_id() -> str | None:
@@ -435,12 +452,34 @@ def _get_slurm_job_id() -> str | None:
 
 
 def _read_lock_file(lock_dir: str, run_id: str) -> dict | None:
-    """Read and parse a lock file. Returns None if missing or malformed."""
+    """Read and parse lock metadata. Returns None if missing or malformed."""
     try:
-        with open(os.path.join(lock_dir, f"{run_id}.lock")) as f:
+        with open(os.path.join(lock_dir, f"{run_id}.lock", "lock_meta.json")) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, NotADirectoryError):
         return None
+
+
+def _get_lock_age(lock_path: str) -> float:
+    """Return the age of a lock in seconds.
+
+    Reads the timestamp from lock_meta.json if available, otherwise falls back
+    to the directory (or file) mtime.  Returns 0 on any error.
+    """
+    try:
+        meta_path = os.path.join(lock_path, "lock_meta.json")
+        with open(meta_path) as f:
+            ts = json.load(f).get("timestamp")
+        if ts:
+            created = calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+            return time.time() - created
+    except (OSError, json.JSONDecodeError, ValueError, KeyError):
+        pass
+    # Fallback to filesystem mtime
+    try:
+        return time.time() - os.path.getmtime(lock_path)
+    except OSError:
+        return 0
 
 
 def _check_slurm_jobs_alive(job_ids: set[str]) -> set[str]:
@@ -631,23 +670,14 @@ def main_loop(args):
                 if sjid and sjid not in alive_slurm_jobs:
                     resume_path = os.path.join(lock_dir, f"{rid}.resume.lock")
                     print(f"[sweep] {rid}: resume lock held by dead slurm job {sjid} — removing")
-                    try:
-                        os.remove(resume_path)
-                    except OSError:
-                        pass
+                    shutil.rmtree(resume_path, ignore_errors=True)
                 elif not sjid:
                     # Legacy lock without slurm_job_id — use age-based cleanup
                     resume_path = os.path.join(lock_dir, f"{rid}.resume.lock")
-                    try:
-                        lock_age = time.time() - os.path.getmtime(resume_path)
-                    except OSError:
-                        lock_age = 0
+                    lock_age = _get_lock_age(resume_path)
                     if lock_age > 2 * 3600:  # 2 hours
                         print(f"[sweep] {rid}: resume lock without job ID, age {lock_age/3600:.1f}h — removing")
-                        try:
-                            os.remove(resume_path)
-                        except OSError:
-                            pass
+                        shutil.rmtree(resume_path, ignore_errors=True)
 
         n_done = 0
         n_running = 0
@@ -691,10 +721,7 @@ def main_loop(args):
                 if slurm_dead:
                     print(f"[sweep] {rid}: wandb=running but slurm job {sjid} is dead — reclaiming")
                     # Remove stale lock so try_claim() can create a fresh one
-                    try:
-                        os.remove(os.path.join(lock_dir, f"{rid}.lock"))
-                    except OSError:
-                        pass
+                    shutil.rmtree(os.path.join(lock_dir, f"{rid}.lock"), ignore_errors=True)
                     if has_ckpt:
                         resumable.append(c)
                     else:
@@ -715,17 +742,11 @@ def main_loop(args):
                     # likely OOM'd or crashed before making progress.  Remove
                     # the lock so another worker can pick it up.
                     if not has_ckpt:
-                        try:
-                            lock_age = time.time() - os.path.getmtime(lock_path)
-                        except OSError:
-                            lock_age = 0
+                        lock_age = _get_lock_age(lock_path)
                         if lock_age > 30 * 60:  # 30 minutes
                             print(f"[sweep] Removing stale lock for {rid} "
                                   f"(age {lock_age/60:.0f}m, no checkpoint)")
-                            try:
-                                os.remove(lock_path)
-                            except OSError:
-                                pass
+                            shutil.rmtree(lock_path, ignore_errors=True)
                         else:
                             continue
                     else:
@@ -770,6 +791,12 @@ def main_loop(args):
                 max_iters = int(c["config"].training.max_iters)
                 heartbeat.set_training(rid, config_label, c["out_dir"], max_iters)
                 resume_lock = os.path.join(lock_dir, f"{rid}.resume.lock")
+                # Re-check wandb to avoid racing with another worker
+                recheck = query_wandb_status(project, [rid])
+                if recheck.get(rid, {}).get("state") == "running":
+                    print(f"[sweep] {rid} already running in wandb — releasing resume claim")
+                    shutil.rmtree(resume_lock, ignore_errors=True)
+                    continue
                 try:
                     run_training(c["config"], rid, c["out_dir"], args.cluster, args.wandb_buffer)
                     consecutive_failures = 0
@@ -788,10 +815,7 @@ def main_loop(args):
                     time.sleep(backoff)
                 finally:
                     # Always remove resume lock so a future cycle can re-claim
-                    try:
-                        os.remove(resume_lock)
-                    except FileNotFoundError:
-                        pass
+                    shutil.rmtree(resume_lock, ignore_errors=True)
                 attempted = True
                 break
 
@@ -802,6 +826,12 @@ def main_loop(args):
                 )
                 max_iters = int(c["config"].training.max_iters)
                 heartbeat.set_training(rid, config_label, c["out_dir"], max_iters)
+                # Re-check wandb to avoid racing with another worker
+                recheck = query_wandb_status(project, [rid])
+                if recheck.get(rid, {}).get("state") == "running":
+                    print(f"[sweep] {rid} already running in wandb — releasing claim")
+                    shutil.rmtree(os.path.join(lock_dir, f"{rid}.lock"), ignore_errors=True)
+                    continue
                 try:
                     run_training(c["config"], rid, c["out_dir"], args.cluster, args.wandb_buffer)
                     consecutive_failures = 0
