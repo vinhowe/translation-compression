@@ -145,6 +145,27 @@ class ConfigManager:
                 "experiment.n_compartments must be <= experiment.max_compartments"
             )
 
+        # Per-compartment data sources validation
+        data = self.config.data
+        if data.compartment_train_bins is not None:
+            if len(data.compartment_train_bins) != exp.n_compartments:
+                raise ValueError(
+                    f"data.compartment_train_bins has {len(data.compartment_train_bins)} entries "
+                    f"but experiment.n_compartments is {exp.n_compartments}"
+                )
+        if data.compartment_val_bins is not None:
+            if len(data.compartment_val_bins) != exp.n_compartments:
+                raise ValueError(
+                    f"data.compartment_val_bins has {len(data.compartment_val_bins)} entries "
+                    f"but experiment.n_compartments is {exp.n_compartments}"
+                )
+        # Token tying is incompatible with per-compartment data sources
+        if data.compartment_train_bins is not None and exp.token_tying_mode != "none":
+            raise ValueError(
+                "data.compartment_train_bins is incompatible with "
+                "experiment.token_tying_mode != 'none'"
+            )
+
         # Token tying validation
         if not (0.0 <= exp.token_tying_ratio <= 1.0):
             raise ValueError("experiment.token_tying_ratio must be in [0, 1]")

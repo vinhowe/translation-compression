@@ -243,6 +243,71 @@ class DistributedDataLoader:
         return x, y
 
 
+class _TokenStream:
+    """Sequential token reader over a set of .bin shards."""
+
+    def __init__(self, filename_pattern: str, process_rank: int, T: int):
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, (
+            f"did not find any files that match the pattern {filename_pattern}"
+        )
+        self.current_shard = 0
+        self.tokens = _load_data_shard(self.files[0])
+        if len(self.tokens) > (T + 2):
+            self.token_pos = (process_rank * T) % (len(self.tokens) - (T + 2))
+        else:
+            self.token_pos = 0
+
+    def read_tokens(self, n: int) -> np.ndarray:
+        out = np.empty(n, dtype=np.int32)
+        filled = 0
+        while filled < n:
+            remaining = len(self.tokens) - self.token_pos
+            if remaining <= 1:
+                self.advance()
+                continue
+            can_take = min(n - filled, remaining)
+            out[filled : filled + can_take] = self.tokens[
+                self.token_pos : self.token_pos + can_take
+            ].astype(np.int32)
+            self.token_pos += can_take
+            filled += can_take
+            if self.token_pos >= len(self.tokens):
+                self.advance()
+        return out
+
+    def advance(self) -> None:
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.token_pos = 0
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def load_shard(self, idx: int) -> None:
+        new_idx = idx % len(self.files)
+        if new_idx != self.current_shard:
+            self.current_shard = new_idx
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.token_pos = 0
+
+    def state_dict(self) -> dict:
+        return {
+            "current_shard": self.current_shard,
+            "token_pos": self.token_pos,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        shard = state["current_shard"]
+        if shard != self.current_shard:
+            self.load_shard(shard)
+        self.token_pos = state["token_pos"]
+
+    def reset(self, process_rank: int, T: int) -> None:
+        self.load_shard(0)
+        if len(self.tokens) > (T + 2):
+            self.token_pos = (process_rank * T) % (len(self.tokens) - (T + 2))
+        else:
+            self.token_pos = 0
+
+
 class AssignmentsDataLoader:
     def __init__(
         self,
@@ -262,6 +327,7 @@ class AssignmentsDataLoader:
         tied_token_mask: Optional[np.ndarray] = None,
         tying_remap: Optional[np.ndarray] = None,
         translation_token_id: Optional[int] = None,
+        compartment_filename_patterns: Optional[list[str]] = None,
     ) -> None:
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -322,21 +388,17 @@ class AssignmentsDataLoader:
             self._records = np.frombuffer(f.read(), dtype=np.uint64)
         self.num_records = int(self._records.shape[0])
 
-        # Prepare token shards
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, (
-            f"did not find any files that match the pattern {filename_pattern}"
-        )
-        self.current_shard = 0
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-        self.token_pos = 0
-        # offset per rank
-        if len(self.tokens) > (self.T + 2):
-            self.token_pos = (self.process_rank * self.T) % (
-                len(self.tokens) - (self.T + 2)
-            )
+        # Multi-source mode: one _TokenStream per compartment
+        self._multi_source = compartment_filename_patterns is not None
+        if self._multi_source:
+            self._streams = [
+                _TokenStream(pat, process_rank, T)
+                for pat in compartment_filename_patterns  # type: ignore[union-attr]
+            ]
+            self._stream: Optional[_TokenStream] = None
         else:
-            self.token_pos = 0
+            self._stream = _TokenStream(filename_pattern, process_rank, T)
+            self._streams: Optional[list[_TokenStream]] = None
 
         # assignment index start (strided by world size)
         self.assignment_idx = self.process_rank % max(1, self.num_records)
@@ -352,36 +414,6 @@ class AssignmentsDataLoader:
             self._y_buf = None
             self._cids_buf = None
 
-    def _load_shard(self, idx: int) -> None:
-        new_idx = idx % len(self.files)
-        if new_idx != self.current_shard:
-            self.current_shard = new_idx
-            self.tokens = _load_data_shard(self.files[self.current_shard])
-        # Always reset token position when (re)loading or cycling shards,
-        # including the single-shard case where new_idx == current_shard.
-        self.token_pos = 0
-
-    def _advance_shard(self) -> None:
-        self._load_shard((self.current_shard + 1) % len(self.files))
-
-    def _read_tokens(self, n: int) -> np.ndarray:
-        out = np.empty(n, dtype=np.int32)
-        filled = 0
-        while filled < n:
-            remaining = len(self.tokens) - self.token_pos
-            if remaining <= 1:  # keep one token gap safety
-                self._advance_shard()
-                continue
-            can_take = min(n - filled, remaining)
-            out[filled : filled + can_take] = self.tokens[
-                self.token_pos : self.token_pos + can_take
-            ].astype(np.int32)
-            self.token_pos += can_take
-            filled += can_take
-            if self.token_pos >= len(self.tokens):
-                self._advance_shard()
-        return out
-
     @staticmethod
     def _decode_record(word: np.uint64) -> tuple[int, int, int]:
         w = int(word)
@@ -391,22 +423,64 @@ class AssignmentsDataLoader:
         return kind, src, dst
 
     def state_dict(self) -> dict:
-        return {
-            "current_shard": self.current_shard,
-            "token_pos": self.token_pos,
-            "assignment_idx": self.assignment_idx,
-        }
+        if self._multi_source:
+            return {
+                "assignment_idx": self.assignment_idx,
+                "streams": [s.state_dict() for s in self._streams],  # type: ignore[union-attr]
+            }
+        else:
+            return {
+                "assignment_idx": self.assignment_idx,
+                **self._stream.state_dict(),  # type: ignore[union-attr]
+            }
 
     def load_state_dict(self, state: dict) -> None:
-        shard = state["current_shard"]
-        if shard != self.current_shard:
-            self._load_shard(shard)
-        self.token_pos = state["token_pos"]
         self.assignment_idx = state["assignment_idx"]
+        if "streams" in state:
+            # Multi-source checkpoint
+            for s, sd in zip(self._streams, state["streams"]):  # type: ignore[arg-type]
+                s.load_state_dict(sd)
+        else:
+            # Single-source checkpoint (backward compat)
+            if self._multi_source:
+                # Resuming a multi-source loader from an old single-source checkpoint:
+                # reset all streams to initial state
+                for s in self._streams:  # type: ignore[union-attr]
+                    s.reset(self.process_rank, self.T)
+            else:
+                self._stream.load_state_dict(state)  # type: ignore[union-attr]
 
     def reset(self) -> None:
-        self._load_shard(0)
+        if self._multi_source:
+            for s in self._streams:  # type: ignore[union-attr]
+                s.reset(self.process_rank, self.T)
+        else:
+            self._stream.reset(self.process_rank, self.T)  # type: ignore[union-attr]
         self.assignment_idx = self.process_rank % max(1, self.num_records)
+
+    def _read_multi_source_tokens(
+        self, B, is_trans, srcs, dsts, kinds, half, T
+    ):
+        """Read tokens from per-compartment streams, returning per-item arrays.
+
+        Returns:
+            comp_samples: dict mapping batch index -> np.ndarray[T] for compartment items
+            trans_src_samples: dict mapping batch index -> np.ndarray[half] for translation src
+            trans_dst_samples: dict mapping batch index -> np.ndarray[half] for translation dst
+        """
+        streams = self._streams  # type: ignore[union-attr]
+        comp_samples: dict[int, np.ndarray] = {}
+        trans_src_samples: dict[int, np.ndarray] = {}
+        trans_dst_samples: dict[int, np.ndarray] = {}
+        for b in range(B):
+            if is_trans[b]:
+                src_tokens = streams[int(srcs[b])].read_tokens(half).astype(np.int64)
+                dst_tokens = streams[int(dsts[b])].read_tokens(half).astype(np.int64)
+                trans_src_samples[b] = src_tokens
+                trans_dst_samples[b] = dst_tokens
+            else:
+                comp_samples[b] = streams[int(srcs[b])].read_tokens(T).astype(np.int64)
+        return comp_samples, trans_src_samples, trans_dst_samples
 
     def next_batch(self):
         B = self.B
@@ -442,128 +516,31 @@ class AssignmentsDataLoader:
         idx_trans = np.nonzero(is_trans)[0]
         idx_comp = np.nonzero(~is_trans)[0]
 
-        # Preserve per-example token consumption order: compute sizes and a single contiguous slice
-        size_per_b = np.where(is_trans, half, T).astype(np.int64, copy=False)
         if B == 0:
             return x_t, y_t, cids_t
-        starts = np.zeros(B, dtype=np.int64)
-        if B > 1:
-            starts[1:] = np.cumsum(size_per_b[:-1], dtype=np.int64)
-        total_needed = int(starts[-1] + size_per_b[-1])
-        tokens_batch = self._read_tokens(total_needed).astype(np.int64, copy=False)
 
-        # Translation group: gather half-length segments in b-order
-        if idx_trans.size > 0:
-            m = int(idx_trans.size)
-            base_idx_half = np.arange(half, dtype=np.int64)[None, :]
-            trans_starts = starts[idx_trans][:, None]
-            samples = tokens_batch[trans_starts + base_idx_half]
-
-            # Prepare input/output seq and cids for translation rows
-            seq_in = np.empty((m, T), dtype=np.int64)
-            seq_out = np.empty((m, T), dtype=np.int64)
-            cid_tr = np.empty((m, T), dtype=np.int64)
-
-            # Set translation token positions and cids (same for input/output)
-            seq_in[:, 0] = self.translation_token_id
-            seq_in[:, half] = self.translation_token_id
-            seq_out[:, 0] = self.translation_token_id
-            seq_out[:, half] = self.translation_token_id
-            cid_tr[:, 0] = srcs[idx_trans]
-            cid_tr[:, half] = dsts[idx_trans]
-
-            if self.permute_tokens:
-                # Direct fancy indexing - avoids loading full rows (2000x faster)
-                # Old approach loaded entire rows (~311MB), new approach loads only needed elements (~64KB)
-                perms = cast(np.ndarray, self._permutations)
-                src_comp = srcs[idx_trans][:, None]  # [m, 1]
-                dst_comp = dsts[idx_trans][:, None]  # [m, 1]
-                token_slice = samples[:, : half - 1]  # [m, half-1]
-                perm_src = perms[
-                    np.broadcast_to(src_comp, token_slice.shape), token_slice
-                ]
-                perm_dst = perms[
-                    np.broadcast_to(dst_comp, token_slice.shape), token_slice
-                ]
-                # Inputs: optionally permuted
-                if self.permute_inputs:
-                    seq_in[:, 1:half] = perm_src
-                    seq_in[:, half + 1 :] = perm_dst
-                else:
-                    seq_in[:, 1:half] = samples[:, : half - 1]
-                    seq_in[:, half + 1 :] = samples[:, : half - 1]
-                # Targets: always in permuted space
-                seq_out[:, 1:half] = perm_src
-                seq_out[:, half + 1 :] = perm_dst
-            else:
-                token_slice = samples[:, : half - 1]
-                if self._tying_remap is not None:
-                    # Compact remap: remap[comp, base_token] -> compact_id
-                    remap = self._tying_remap
-                    src_comp = srcs[idx_trans]
-                    dst_comp = dsts[idx_trans]
-                    seq_in[:, 1:half] = remap[src_comp[:, None], token_slice]
-                    seq_in[:, half + 1 :] = remap[dst_comp[:, None], token_slice]
-                else:
-                    base = self.base_vocab_size
-                    src_off = srcs[idx_trans][:, None] * base
-                    dst_off = dsts[idx_trans][:, None] * base
-                    seq_in[:, 1:half] = token_slice + src_off
-                    seq_in[:, half + 1 :] = token_slice + dst_off
-                # Without permutation, inputs and outputs are identical
-                seq_out[:, 1:half] = seq_in[:, 1:half]
-                seq_out[:, half + 1 :] = seq_in[:, half + 1 :]
-
-            # Fill cids across spans
-            cid_tr[:, 1:half] = srcs[idx_trans][:, None]
-            cid_tr[:, half + 1 :] = dsts[idx_trans][:, None]
-
-            # Targets: next-token; last is ignored
-            y_tr = np.empty_like(seq_out)
-            y_tr[:, :-1] = seq_out[:, 1:]
-            y_tr[:, -1] = -1
-
-            # Scatter into batch slots
-            x_np[idx_trans] = seq_in
-            y_np[idx_trans] = y_tr
-            cid_np[idx_trans] = cid_tr
-
-        # Compartment group: gather T-length segments in b-order
-        if idx_comp.size > 0:
-            base_idx_T = np.arange(T, dtype=np.int64)[None, :]
-            comp_starts = starts[idx_comp][:, None]
-            samples = tokens_batch[comp_starts + base_idx_T]
-
-            if self.permute_tokens:
-                # Direct fancy indexing - avoids loading full rows (2000x faster)
-                perms = cast(np.ndarray, self._permutations)
-                src_comp = srcs[idx_comp][:, None]  # [n, 1]
-                perm_samples = perms[np.broadcast_to(src_comp, samples.shape), samples]
-                # Inputs: optionally permuted
-                if self.permute_inputs:
-                    x_comp = perm_samples
-                else:
-                    x_comp = samples
-                # Targets: always in permuted space
-                y_comp = np.empty_like(perm_samples)
-                y_comp[:, :-1] = perm_samples[:, 1:]
-                y_comp[:, -1] = -1
-            else:
-                if self._tying_remap is not None:
-                    remap = self._tying_remap
-                    src_comp = srcs[idx_comp]
-                    x_comp = remap[src_comp[:, None], samples]
-                else:
-                    base = self.base_vocab_size
-                    src_off = srcs[idx_comp][:, None] * base
-                    x_comp = samples + src_off
-                y_comp = np.empty_like(x_comp)
-                y_comp[:, :-1] = x_comp[:, 1:]
-                y_comp[:, -1] = -1
-
-            x_np[idx_comp] = x_comp
-            y_np[idx_comp] = y_comp
-            cid_np[idx_comp, :] = srcs[idx_comp][:, None]
+        if self._multi_source:
+            # Multi-source: read from per-compartment streams
+            comp_samples, trans_src_samples, trans_dst_samples = (
+                self._read_multi_source_tokens(B, is_trans, srcs, dsts, kinds, half, T)
+            )
+            self._fill_batch_multi_source(
+                x_np, y_np, cid_np, idx_comp, idx_trans, srcs, dsts,
+                comp_samples, trans_src_samples, trans_dst_samples,
+                half, T,
+            )
+        else:
+            # Single-source: read contiguous tokens from one stream
+            size_per_b = np.where(is_trans, half, T).astype(np.int64, copy=False)
+            starts = np.zeros(B, dtype=np.int64)
+            if B > 1:
+                starts[1:] = np.cumsum(size_per_b[:-1], dtype=np.int64)
+            total_needed = int(starts[-1] + size_per_b[-1])
+            tokens_batch = self._stream.read_tokens(total_needed).astype(np.int64, copy=False)  # type: ignore[union-attr]
+            self._fill_batch_single_source(
+                x_np, y_np, cid_np, idx_comp, idx_trans, srcs, dsts,
+                tokens_batch, starts, half, T,
+            )
 
         # advance assignment pointer for next batch
         self.assignment_idx = (
@@ -580,6 +557,7 @@ class AssignmentsDataLoader:
                 B > 0
                 and T > 1
                 and not (self.permute_tokens and not self.permute_inputs)
+                and not self._multi_source
             ):
                 assert (y_np[:, :-1] == x_np[:, 1:]).all()
             if idx_trans.size > 0:
@@ -595,6 +573,157 @@ class AssignmentsDataLoader:
                 assert (x_np >= 0).all() and (x_np < max_vocab).all()
 
         return x_t, y_t, cids_t
+
+    def _fill_batch_single_source(
+        self, x_np, y_np, cid_np, idx_comp, idx_trans, srcs, dsts,
+        tokens_batch, starts, half, T,
+    ):
+        """Fill batch arrays from a single contiguous token stream (original behavior)."""
+        # Translation group: gather half-length segments in b-order
+        if idx_trans.size > 0:
+            m = int(idx_trans.size)
+            base_idx_half = np.arange(half, dtype=np.int64)[None, :]
+            trans_starts = starts[idx_trans][:, None]
+            samples = tokens_batch[trans_starts + base_idx_half]
+
+            self._fill_translation_rows(
+                x_np, y_np, cid_np, idx_trans, srcs, dsts,
+                samples, samples,  # same content for src and dst halves
+                half, T,
+            )
+
+        # Compartment group: gather T-length segments in b-order
+        if idx_comp.size > 0:
+            base_idx_T = np.arange(T, dtype=np.int64)[None, :]
+            comp_starts = starts[idx_comp][:, None]
+            samples = tokens_batch[comp_starts + base_idx_T]
+            self._fill_compartment_rows(x_np, y_np, cid_np, idx_comp, srcs, samples, T)
+
+    def _fill_batch_multi_source(
+        self, x_np, y_np, cid_np, idx_comp, idx_trans, srcs, dsts,
+        comp_samples, trans_src_samples, trans_dst_samples, half, T,
+    ):
+        """Fill batch arrays from per-compartment token streams."""
+        # Translation group
+        if idx_trans.size > 0:
+            m = int(idx_trans.size)
+            # Stack per-item arrays into [m, half] arrays
+            src_stacked = np.stack([trans_src_samples[int(b)] for b in idx_trans])
+            dst_stacked = np.stack([trans_dst_samples[int(b)] for b in idx_trans])
+            self._fill_translation_rows(
+                x_np, y_np, cid_np, idx_trans, srcs, dsts,
+                src_stacked, dst_stacked,
+                half, T,
+            )
+
+        # Compartment group
+        if idx_comp.size > 0:
+            samples = np.stack([comp_samples[int(b)] for b in idx_comp])
+            self._fill_compartment_rows(x_np, y_np, cid_np, idx_comp, srcs, samples, T)
+
+    def _fill_translation_rows(
+        self, x_np, y_np, cid_np, idx_trans, srcs, dsts,
+        src_samples, dst_samples, half, T,
+    ):
+        """Fill translation rows into batch arrays.
+
+        src_samples: [m, half] tokens for the source half
+        dst_samples: [m, half] tokens for the destination half
+        In single-source mode, src_samples and dst_samples are the same array.
+        In multi-source mode, they contain different content from different streams.
+        """
+        m = int(idx_trans.size)
+        seq_in = np.empty((m, T), dtype=np.int64)
+        seq_out = np.empty((m, T), dtype=np.int64)
+        cid_tr = np.empty((m, T), dtype=np.int64)
+
+        # Set translation token positions and cids
+        seq_in[:, 0] = self.translation_token_id
+        seq_in[:, half] = self.translation_token_id
+        seq_out[:, 0] = self.translation_token_id
+        seq_out[:, half] = self.translation_token_id
+        cid_tr[:, 0] = srcs[idx_trans]
+        cid_tr[:, half] = dsts[idx_trans]
+
+        src_slice = src_samples[:, : half - 1]  # [m, half-1]
+        dst_slice = dst_samples[:, : half - 1]  # [m, half-1]
+
+        if self.permute_tokens:
+            perms = cast(np.ndarray, self._permutations)
+            src_comp = srcs[idx_trans][:, None]  # [m, 1]
+            dst_comp = dsts[idx_trans][:, None]  # [m, 1]
+            perm_src = perms[
+                np.broadcast_to(src_comp, src_slice.shape), src_slice
+            ]
+            perm_dst = perms[
+                np.broadcast_to(dst_comp, dst_slice.shape), dst_slice
+            ]
+            if self.permute_inputs:
+                seq_in[:, 1:half] = perm_src
+                seq_in[:, half + 1 :] = perm_dst
+            else:
+                seq_in[:, 1:half] = src_slice
+                seq_in[:, half + 1 :] = dst_slice
+            seq_out[:, 1:half] = perm_src
+            seq_out[:, half + 1 :] = perm_dst
+        else:
+            if self._tying_remap is not None:
+                remap = self._tying_remap
+                src_comp = srcs[idx_trans]
+                dst_comp = dsts[idx_trans]
+                seq_in[:, 1:half] = remap[src_comp[:, None], src_slice]
+                seq_in[:, half + 1 :] = remap[dst_comp[:, None], dst_slice]
+            else:
+                base = self.base_vocab_size
+                src_off = srcs[idx_trans][:, None] * base
+                dst_off = dsts[idx_trans][:, None] * base
+                seq_in[:, 1:half] = src_slice + src_off
+                seq_in[:, half + 1 :] = dst_slice + dst_off
+            seq_out[:, 1:half] = seq_in[:, 1:half]
+            seq_out[:, half + 1 :] = seq_in[:, half + 1 :]
+
+        cid_tr[:, 1:half] = srcs[idx_trans][:, None]
+        cid_tr[:, half + 1 :] = dsts[idx_trans][:, None]
+
+        y_tr = np.empty_like(seq_out)
+        y_tr[:, :-1] = seq_out[:, 1:]
+        y_tr[:, -1] = -1
+
+        x_np[idx_trans] = seq_in
+        y_np[idx_trans] = y_tr
+        cid_np[idx_trans] = cid_tr
+
+    def _fill_compartment_rows(
+        self, x_np, y_np, cid_np, idx_comp, srcs, samples, T,
+    ):
+        """Fill compartment rows into batch arrays."""
+        if self.permute_tokens:
+            perms = cast(np.ndarray, self._permutations)
+            src_comp = srcs[idx_comp][:, None]
+            perm_samples = perms[np.broadcast_to(src_comp, samples.shape), samples]
+            if self.permute_inputs:
+                x_comp = perm_samples
+            else:
+                x_comp = samples
+            y_comp = np.empty_like(perm_samples)
+            y_comp[:, :-1] = perm_samples[:, 1:]
+            y_comp[:, -1] = -1
+        else:
+            if self._tying_remap is not None:
+                remap = self._tying_remap
+                src_comp = srcs[idx_comp]
+                x_comp = remap[src_comp[:, None], samples]
+            else:
+                base = self.base_vocab_size
+                src_off = srcs[idx_comp][:, None] * base
+                x_comp = samples + src_off
+            y_comp = np.empty_like(x_comp)
+            y_comp[:, :-1] = x_comp[:, 1:]
+            y_comp[:, -1] = -1
+
+        x_np[idx_comp] = x_comp
+        y_np[idx_comp] = y_comp
+        cid_np[idx_comp, :] = srcs[idx_comp][:, None]
 
 
 STORAGE_ROOT = os.environ.get(
@@ -1339,6 +1468,8 @@ def main(config: JobConfig) -> None:
     # Data loaders: pretokenized assignments-based vs uniform synthetic
     if use_pretokenized:
         # Custom assignments-driven dataloader that transforms tokens per assignments.bin
+        compartment_train_patterns = config.data.compartment_train_bins
+        compartment_val_patterns = config.data.compartment_val_bins
         train_loader = AssignmentsDataLoader(
             assignments_path,
             train_bin,
@@ -1357,12 +1488,13 @@ def main(config: JobConfig) -> None:
             tied_token_mask=tied_token_mask,
             tying_remap=tying_remap,
             translation_token_id=translation_token_id_cfg,
+            compartment_filename_patterns=compartment_train_patterns,
         )
         val_loader = None
-        if val_bin:
+        if val_bin or compartment_val_patterns:
             val_loader = AssignmentsDataLoader(
                 assignments_path,
-                val_bin,
+                val_bin or "",
                 batch_size,
                 block_size,
                 ddp_rank or 0,
@@ -1380,6 +1512,7 @@ def main(config: JobConfig) -> None:
                 tied_token_mask=tied_token_mask,
                 tying_remap=tying_remap,
                 translation_token_id=translation_token_id_cfg,
+                compartment_filename_patterns=compartment_val_patterns,
             )
     else:
         # Uniform synthetic stream
