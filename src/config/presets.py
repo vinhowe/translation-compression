@@ -44,6 +44,45 @@ BPE16384_BATCH_SPECS: dict[tuple[int, int], tuple[int, int]] = {
 }
 
 
+BASELINE_VRAM_GB = 80.0
+
+
+def scale_batch_for_vram(cfg: JobConfig, vram_bytes: int) -> JobConfig:
+    """Scale batch_size up and grad_accum down based on available VRAM.
+
+    Preserves effective batch size (batch_size * grad_accum). Only applies
+    when current batch config was set by BPE16384_BATCH_SPECS.
+    """
+    vram_gb = vram_bytes / (1024**3)
+    if vram_gb <= BASELINE_VRAM_GB:
+        return cfg
+
+    batch_size = cfg.training.batch_size
+    grad_accum = cfg.training.gradient_accumulation_steps
+    effective_bs = batch_size * grad_accum
+
+    if grad_accum <= 1:
+        return cfg  # already minimal accumulation
+
+    max_batch = int(batch_size * vram_gb / BASELINE_VRAM_GB)
+    new_batch = batch_size
+    candidate = batch_size * 2
+    while candidate <= max_batch and effective_bs % candidate == 0:
+        new_batch = candidate
+        candidate *= 2
+    new_accum = effective_bs // new_batch
+
+    if new_batch == batch_size:
+        return cfg
+
+    new_training = replace(
+        cfg.training,
+        batch_size=new_batch,
+        gradient_accumulation_steps=new_accum,
+    )
+    return replace(cfg, training=new_training)
+
+
 def apply_bpe16384_batch_config(cfg: JobConfig) -> JobConfig:
     """Auto-configure batch_size and gradient_accumulation_steps for vocab_size=16384.
 
