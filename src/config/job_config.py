@@ -18,6 +18,10 @@ class Data:
     train_bin: str = ""
     val_bin: str | None = None
     uniform_seed: int = 0
+    # Per-compartment data source glob patterns (one per compartment).
+    # When set, each compartment reads from its own set of .bin shards.
+    compartment_train_bins: list[str] | None = None
+    compartment_val_bins: list[str] | None = None
 
 
 @dataclass(frozen=True)
