@@ -42,7 +42,7 @@ from src.dann import DANNModule, parse_dann_layers
 from src.data import UniformBatchDataLoader, UniformCompartmentDataLoader
 from src.assignments import write_assignments
 from src.token_tying import compute_token_frequencies, compute_tied_mask, apply_tying_to_permutations, build_tying_remap
-from src.config.presets import apply_size_tier, apply_bpe16384_batch_config
+from src.config.presets import apply_size_tier, apply_bpe16384_batch_config, scale_batch_for_vram
 from src.weights import compute_weights_map
 import struct
 import threading
@@ -768,6 +768,12 @@ def main(config: JobConfig) -> None:
     config = apply_size_tier(config)
     # Auto-configure batch/grad_accum for bpe16384 vocab if not explicitly set
     config = apply_bpe16384_batch_config(config)
+    # Scale batch for available VRAM (preserves effective batch size)
+    if torch.cuda.is_available():
+        _local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        _vram = torch.cuda.get_device_properties(_local_rank).total_memory
+        config = scale_batch_for_vram(config, _vram)
+        print0(f"VRAM: {_vram / 1024**3:.0f}GB -> batch_size={config.training.batch_size}, grad_accum={config.training.gradient_accumulation_steps}")
     config = replace(
         config,
         experiment=replace(config.experiment, assignment_seed=config.training.seed),
