@@ -1,0 +1,24 @@
+method: grid
+name: bpe16384-rope-8-256
+project: translation-compression
+program: train.py
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --job.config-file
+  - ./config/sweep-base-bpe16384-absolute.toml
+  - ${args}
+parameters:
+  model.size_tier:
+    values: ["8-256"]
+  model.use_rope:
+    values: [true]
+  experiment.n_compartments:
+    values: [2, 3, 4, 5, 6, 8]
+  experiment.translation_ratio_mode:
+    values: ["absolute", "compartment"]
+  experiment.translation_ratio:
+    values: [0.1, 0.25, 0.5, 0.75, 1.0]
+  training.seed:
+    values: [64]
