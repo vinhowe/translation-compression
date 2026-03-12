@@ -1357,6 +1357,9 @@ def main(config: JobConfig) -> None:
                     if exp_cfg.permute_tokens_per_compartment
                     else bool(config.experiment.copy_compartment_lm_head)
                 ),
+                "copy_compartment_id_embeddings": bool(
+                    config.experiment.copy_compartment_id_embeddings
+                ),
                 "base_vocab_size": base_vocab,
                 "max_compartments": exp_cfg.n_compartments,
                 "translation_token_id": translation_token_id_cfg,
@@ -1400,6 +1403,9 @@ def main(config: JobConfig) -> None:
                     False
                     if exp_cfg.permute_tokens_per_compartment
                     else bool(config.experiment.copy_compartment_lm_head)
+                ),
+                "copy_compartment_id_embeddings": bool(
+                    config.experiment.copy_compartment_id_embeddings
                 ),
                 "base_vocab_size": base_vocab,
                 "max_compartments": exp_cfg.n_compartments,  # Use n_compartments for model sizing

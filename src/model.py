@@ -213,6 +213,9 @@ class GPT(nn.Module):
         self.copy_compartment_lm_head: bool = bool(
             getattr(config, "copy_compartment_lm_head", False)
         )
+        self.copy_compartment_id_embeddings: bool = bool(
+            getattr(config, "copy_compartment_id_embeddings", False)
+        )
         # RoPE configuration
         self.use_rope: bool = bool(getattr(config, "use_rope", False))
         rope_base: float = float(getattr(config, "rope_base", 10000.0))
@@ -310,6 +313,18 @@ class GPT(nn.Module):
                         end = start + self.base_vocab_size
                         head_w[start:end].copy_(base)
                 # else: skip silently per request
+
+        # Optionally, copy compartment 0's ID embedding to all other compartments
+        if (
+            self.copy_compartment_id_embeddings
+            and self.use_compartment_embeddings
+            and self.comp_emb is not None
+            and self.max_compartments is not None
+        ):
+            with torch.no_grad():
+                base_vec = self.comp_emb.weight[0].clone()
+                for c in range(1, self.max_compartments):
+                    self.comp_emb.weight[c].copy_(base_vec)
 
         # DANN: set of layer indices to collect outputs from (set from train.py before compile)
         self._dann_collect_layers: frozenset[int] | None = None
