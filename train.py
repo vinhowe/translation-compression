@@ -1684,6 +1684,7 @@ def main(config: JobConfig) -> None:
             id=run_id,
             resume="allow",
             name=name_value,
+            settings=wandb.Settings(init_timeout=300),
         )
 
     # training loop
