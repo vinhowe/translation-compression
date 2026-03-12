@@ -50,6 +50,9 @@ class Model:
     copy_compartment_embeddings: bool = False
     # If true, clone the lm_head rows for the base vocab across compartments.
     copy_compartment_lm_head: bool = False
+    # If true and use_compartment_embeddings is enabled, initialize all comp_emb
+    # vectors to be identical copies of compartment 0's vector.
+    copy_compartment_id_embeddings: bool = False
     # vocab_size is derived from dataset meta by default
     vocab_size: int | None = None
     # RoPE (Rotary Position Embeddings) - when enabled, learned positional embeddings are not used
@@ -176,6 +179,7 @@ class Experiment:
     # across compartments during initialization (model-side behavior).
     copy_compartment_embeddings: FlagConversionOff[bool] = False
     copy_compartment_lm_head: FlagConversionOff[bool] = False
+    copy_compartment_id_embeddings: FlagConversionOff[bool] = False
     # If true, use per-compartment permutations of base tokens. Model/tokenizer
     # vocab becomes base_vocab+1 (translation token only) and tokens are mapped
     # through a seeded permutation per compartment at data loading time.

@@ -1,0 +1,46 @@
+[data]
+train_bin = "data/fineweb2-rus-bpe16384/fineweb2-rus_train_*.bin"
+val_bin = "data/fineweb2-rus-bpe16384/fineweb2-rus_val_*.bin"
+
+[model]
+n_layer = 8
+n_head = 4
+n_embd = 256
+block_size = 64
+vocab_size = 16384
+weight_tying = false
+use_rope = true
+
+[training]
+max_iters = 1e6
+batch_size = 2048
+gradient_accumulation_steps = 1
+eval_interval = 500
+always_save_checkpoints = true
+eval_iters = 1
+seed = 64
+log_interval = 10
+
+[optimizer]
+learning_rate = 2e-5
+weight_decay = 0
+
+[system]
+compile = true
+dtype = "bfloat16"
+
+[logging]
+wandb_log = true
+wandb_project = "translation-compression"
+wandb_run_name = "russian-baseline-rope-bpe16384-8-256"
+wandb_notes = "All Russian baseline with RoPE; 8 layers, 256 hidden, 1 compartment"
+wandb_group = "russian-baselines-rope"
+
+[experiment]
+n_compartments = 1
+compartment_scaling = "equal"
+translation_ratio = 0
+max_compartments = 16
+assignment_seed = 64
+use_compartment_embeddings = true
+permute_tokens_per_compartment = false
