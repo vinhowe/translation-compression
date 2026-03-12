@@ -1,0 +1,48 @@
+# Bio3-style synthetic fact learning — full augmentation (permute+fullname), NO QA
+# 1 compartment baseline
+# Generate with: uv run python scripts/generate_bio_dataset.py --n_people 100000 --n_phrasings 5 --permute --fullname
+
+[data]
+train_bin = "data/bio-synthetic-bpe16384-N100000-multi5-permute-fullname-seed42/bio_train_*.bin"
+val_bin = "data/bio-synthetic-bpe16384-N100000-multi5-permute-fullname-seed42/bio_val_*.bin"
+
+[model]
+n_layer = 12
+n_head = 12
+n_embd = 768
+block_size = 512
+vocab_size = 16384
+weight_tying = false
+use_rope = true
+
+[training]
+max_iters = 80000
+batch_size = 96
+gradient_accumulation_steps = 1
+eval_interval = 1000
+always_save_checkpoints = true
+eval_iters = 1
+log_interval = 10
+
+[optimizer]
+learning_rate = 1e-3
+weight_decay = 0.1
+
+[system]
+compile = true
+dtype = "bfloat16"
+
+[logging]
+wandb_log = true
+wandb_project = "translation-compression"
+wandb_run_name = "bio-augmented-1comp"
+wandb_notes = "Bio3 full augmentation (permute+fullname), 1 compartment, no QA"
+wandb_group = "bio-synthetic"
+
+[experiment]
+n_compartments = 1
+compartment_scaling = "equal"
+translation_ratio = 0
+max_compartments = 8
+use_compartment_embeddings = true
+permute_tokens_per_compartment = false
