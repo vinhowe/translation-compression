@@ -308,6 +308,48 @@ class _TokenStream:
             self.token_pos = 0
 
 
+class SyntheticTokenStream:
+    """Token stream that generates synthetic tokens on-the-fly."""
+
+    def __init__(self, mode: str, vocab_size: int, seed: int,
+                 process_rank: int, frequencies: np.ndarray | None = None):
+        self._mode = mode  # "uniform" or "frequency"
+        self._vocab_size = vocab_size
+        self._seed = seed
+        self._process_rank = process_rank
+        self._rng = np.random.Generator(
+            np.random.PCG64(seed + process_rank)
+        )
+        if mode == "frequency":
+            assert frequencies is not None, (
+                "synthetic:frequency requires a frequencies array"
+            )
+            self._probs = (frequencies / frequencies.sum()).astype(np.float64)
+        else:
+            self._probs = None
+
+    def read_tokens(self, n: int) -> np.ndarray:
+        if self._mode == "uniform":
+            return self._rng.integers(0, self._vocab_size, size=n, dtype=np.int32)
+        else:
+            return self._rng.choice(
+                self._vocab_size, size=n, replace=True, p=self._probs
+            ).astype(np.int32)
+
+    def state_dict(self) -> dict:
+        return {"rng_state": self._rng.bit_generator.state}
+
+    def load_state_dict(self, state: dict) -> None:
+        if "rng_state" in state:
+            self._rng.bit_generator.state = state["rng_state"]
+        # Silently ignore incompatible state (e.g. _TokenStream checkpoint)
+
+    def reset(self, process_rank: int, T: int) -> None:
+        self._rng = np.random.Generator(
+            np.random.PCG64(self._seed + process_rank)
+        )
+
+
 class AssignmentsDataLoader:
     def __init__(
         self,
@@ -328,6 +370,8 @@ class AssignmentsDataLoader:
         tying_remap: Optional[np.ndarray] = None,
         translation_token_id: Optional[int] = None,
         compartment_filename_patterns: Optional[list[str]] = None,
+        synthetic_seed: int = 0,
+        synthetic_frequencies: Optional[np.ndarray] = None,
     ) -> None:
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -388,13 +432,22 @@ class AssignmentsDataLoader:
             self._records = np.frombuffer(f.read(), dtype=np.uint64)
         self.num_records = int(self._records.shape[0])
 
-        # Multi-source mode: one _TokenStream per compartment
+        # Multi-source mode: one _TokenStream or SyntheticTokenStream per compartment
         self._multi_source = compartment_filename_patterns is not None
         if self._multi_source:
-            self._streams = [
-                _TokenStream(pat, process_rank, T)
-                for pat in compartment_filename_patterns  # type: ignore[union-attr]
-            ]
+            self._streams = []
+            for i, pat in enumerate(compartment_filename_patterns):  # type: ignore[union-attr]
+                if pat.startswith("synthetic:"):
+                    mode = pat.split(":", 1)[1]
+                    self._streams.append(SyntheticTokenStream(
+                        mode=mode,
+                        vocab_size=base_vocab_size,
+                        seed=synthetic_seed + i * 1_000_000,
+                        process_rank=process_rank,
+                        frequencies=synthetic_frequencies,
+                    ))
+                else:
+                    self._streams.append(_TokenStream(pat, process_rank, T))
             self._stream: Optional[_TokenStream] = None
         else:
             self._stream = _TokenStream(filename_pattern, process_rank, T)
@@ -1482,6 +1535,23 @@ def main(config: JobConfig) -> None:
         # Custom assignments-driven dataloader that transforms tokens per assignments.bin
         compartment_train_patterns = config.data.compartment_train_bins
         compartment_val_patterns = config.data.compartment_val_bins
+
+        # Compute frequency distribution if any compartment uses synthetic:frequency
+        synthetic_freqs = None
+        if compartment_train_patterns and any(
+            p.startswith("synthetic:frequency") for p in compartment_train_patterns
+        ):
+            freq_source = next(
+                (p for p in compartment_train_patterns if not p.startswith("synthetic:")),
+                None,
+            )
+            assert freq_source, "synthetic:frequency needs at least one pretokenized compartment"
+            from src.token_tying import compute_token_frequencies
+            synthetic_freqs = compute_token_frequencies(freq_source, base_vocab)
+            print0(f"Computed token frequencies from {freq_source}")
+
+        synthetic_seed = int(config.data.uniform_seed + training_seed)
+
         train_loader = AssignmentsDataLoader(
             assignments_path,
             train_bin,
@@ -1501,6 +1571,8 @@ def main(config: JobConfig) -> None:
             tying_remap=tying_remap,
             translation_token_id=translation_token_id_cfg,
             compartment_filename_patterns=compartment_train_patterns,
+            synthetic_seed=synthetic_seed,
+            synthetic_frequencies=synthetic_freqs,
         )
         val_loader = None
         if val_bin or compartment_val_patterns:
@@ -1525,6 +1597,8 @@ def main(config: JobConfig) -> None:
                 tying_remap=tying_remap,
                 translation_token_id=translation_token_id_cfg,
                 compartment_filename_patterns=compartment_val_patterns,
+                synthetic_seed=synthetic_seed + 2_000_000_000,
+                synthetic_frequencies=synthetic_freqs,
             )
     else:
         # Uniform synthetic stream
